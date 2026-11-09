@@ -1,4 +1,5 @@
 import json
+import configparser
 from pathlib import Path
 import tempfile
 import unittest
@@ -55,4 +56,9 @@ class ConfigTests(unittest.TestCase):
             path = config.rclone_config()
             stamp = path.stat().st_mtime_ns
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            parser = configparser.ConfigParser(interpolation=None)
+            parser.read(path)
+            token = json.loads(parser['gdrive']['token'])
+            self.assertTrue(token['access_token'])
+            self.assertEqual(token['refresh_token'], 'refresh')
             self.assertEqual(config.rclone_config().stat().st_mtime_ns, stamp)

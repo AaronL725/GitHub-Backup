@@ -187,7 +187,9 @@ class Config:
             "scope": "drive",
             "token": json.dumps(
                 {
-                    "access_token": "",
+                    # rclone treats an empty access token as its obsolete token
+                    # format. An expired placeholder preserves the refresh token.
+                    "access_token": "refresh-required",
                     "refresh_token": self.drive_refresh_token,
                     "expiry": "2000-01-01T00:00:00Z",
                 }
