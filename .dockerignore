@@ -1,0 +1,11 @@
+**
+!Dockerfile
+!pyproject.toml
+!requirements*.lock
+!ghbackup/
+!ghbackup/**
+ghbackup/__pycache__/
+!scripts/
+!scripts/install-tools.py
+!deploy/
+!deploy/tools.lock.json

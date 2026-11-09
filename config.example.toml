@@ -1,0 +1,24 @@
+# Copy to config.toml, fill the values, then chmod 600 config.toml.
+source_owner = "source-account"
+source_token = ""
+destination_owner = "backup-account"
+destination_token = ""
+
+# Google Drive OAuth desktop client. Authorize once to obtain a refresh token.
+drive_repository = "gdrive:GitHub-Backup"
+drive_client_id = ""
+drive_client_secret = ""
+drive_refresh_token = ""
+
+telegram_token = ""
+telegram_user_id = 0
+telegram_show_repo_names = false
+telegram_timezone = "Asia/Shanghai"
+
+# Container paths; normal deployments do not need to change these.
+data_dir = "/var/lib/ghbackup"
+minimum_free_bytes = 5368709120
+include_repo_ids = []
+empty_wiki_ids = []
+protected_destination_ids = []
+destination_write_cooldown_seconds = 3600

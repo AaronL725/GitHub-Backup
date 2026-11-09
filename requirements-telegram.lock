@@ -1,0 +1,11 @@
+# Optional Telegram control plane; pinned independently from the backup engine.
+python-telegram-bot[rate-limiter]==22.8
+httpx==0.28.1
+httpcore==1.0.9
+aiolimiter==1.2.1
+Pillow==13.0.0
+anyio==4.16.0
+certifi==2026.10.23
+idna==3.20
+h11==0.16.0
+typing_extensions==4.16.0

@@ -1,0 +1,37 @@
+name: github-backup
+x-common: &common
+  image: github-backup:local
+  build:
+    context: .
+  restart: unless-stopped
+  init: true
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop: [ALL]
+  tmpfs:
+    - /tmp:mode=1777
+  volumes:
+    - ./config.toml:/run/secrets/ghbackup.toml:ro
+    - ./data:/var/lib/ghbackup:rw
+    - ./restore:/restore:rw
+  environment:
+    TZ: Asia/Shanghai
+  stop_grace_period: 2m
+  logging:
+    driver: local
+    options:
+      max-size: 10m
+      max-file: "3"
+services:
+  scheduler:
+    <<: *common
+    command: [scheduler]
+    healthcheck:
+      test: [CMD, python, -c, "import os,time; assert time.time()-os.stat('/var/lib/ghbackup/scheduler-health.json').st_mtime<120"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+  bot:
+    <<: *common
+    command: [telegram]
