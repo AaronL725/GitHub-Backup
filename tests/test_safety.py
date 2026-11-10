@@ -244,6 +244,21 @@ class ControllerSafetyTests(unittest.TestCase):
         self.assertFalse(entry.get("drive_pending"))
         self.assertTrue(entry["git_snapshot"])
 
+    def test_offline_queue_copies_mutable_metadata_in_objects_named_repository(self):
+        entry = self.ctrl.state["repositories"]["10"]
+        self.ctrl.begin("10", entry, "metadata")
+        relative = Path("export/repositories/objects/issues/1.json")
+        live = self.c.root / "repos/10/metadata" / relative
+        atomic_json(live, {"body": "original"})
+        self.archive.fail = True
+        with self.assertRaises(BackupError):
+            self.ctrl.ready("10", entry)
+        live.write_text('{"body":"updated"}')
+        queued = next((self.c.root / "drive-queue").iterdir())
+        self.assertEqual(
+            read_json(queued / "repos/10/metadata" / relative), {"body": "original"}
+        )
+
     def test_destination_auth_failure_does_not_block_drive_collection(self):
         self.dst.get = Mock(side_effect=BackupError("destination unavailable"))
         self.ctrl.collect_git = Mock()

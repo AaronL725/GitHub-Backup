@@ -312,20 +312,24 @@ class Controller:
     def queue_capture(self, rid, entry):
         """Keep a durable local version while Drive is offline; GitHub can publish it."""
         pending = entry["pending"]
+        category = pending["category"]
+        source = self.root / "repos" / rid / category
         queue = self.root / "drive-queue" / (".building-" + uuid.uuid4().hex)
         queue.mkdir(parents=True, mode=0o700)
 
         def copy_file(src, dst):
-            if "/objects/" in str(src):
+            parts = Path(src).relative_to(source).parts
+            if (
+                category == "git"
+                and parts[0] in {"repository.git", "wiki.git"}
+                and (parts[1:2] == ("objects",) or parts[1:3] == ("lfs", "objects"))
+            ):
                 os.link(src, dst)
             else:
                 shutil.copy2(src, dst)
 
-        category = pending["category"]
         target = queue / "repos" / rid / category
-        shutil.copytree(
-            self.root / "repos" / rid / category, target, copy_function=copy_file
-        )
+        shutil.copytree(source, target, copy_function=copy_file)
         shutil.copy2(
             self.root / "repos" / rid / "source.json", target.parent / "source.json"
         )
