@@ -402,7 +402,12 @@ class Controller:
             except Exception as exc:
                 jobs.append((folder, None))
                 errors.append(
-                    {"stage": "queue", "task": folder.name, "error": type(exc).__name__}
+                    {
+                        "stage": "queue",
+                        "repo_ids": ids,
+                        "task": folder.name,
+                        "error": type(exc).__name__,
+                    }
                 )
         self.save()
         for folder, capture in jobs:
@@ -952,6 +957,11 @@ class Controller:
             and e["stage"] == "archive"
             and self.state["repositories"][e["repo_id"]].get("pending")
         }
+        for error in errors:
+            if error["stage"] == "queue":
+                blocked.update(error.get("repo_ids", []))
+                if error.get("repo_id"):
+                    blocked.add(error["repo_id"])
         for index, rid in enumerate(list(self.state["repositories"])):
             if index and yield_lock:
                 yield_lock()

@@ -17,6 +17,31 @@ from test_safety import config, Source, Destination, FakeArchive, repository
 
 
 class ReviewFaults(unittest.TestCase):
+    def test_failed_queue_pauses_only_that_repository_collection(self):
+        self.ctrl.source.repos.append(repository(11, name="second"))
+        self.ctrl.collect_git = Mock()
+        with patch.object(
+            self.ctrl,
+            "drain_queue",
+            return_value=[{"stage": "queue", "repo_id": "10", "error": "bad capture"}],
+        ):
+            with self.assertRaises(BackupError):
+                self.ctrl.sync("git")
+        self.ctrl.collect_git.assert_called_once()
+        self.assertEqual(self.ctrl.collect_git.call_args.args[0], "11")
+
+    def test_retryable_local_io_error_is_not_a_drive_outage(self):
+        from types import SimpleNamespace
+        from ghbackup.archive import Archive, DriveUnavailable
+
+        result = SimpleNamespace(
+            returncode=5, stdout="", stderr="Cannot open local source file: I/O error"
+        )
+        with patch("ghbackup.archive.subprocess.run", return_value=result):
+            with self.assertRaises(BackupError) as caught:
+                Archive(self.c).command("copy", "local", "remote")
+        self.assertNotIsInstance(caught.exception, DriveUnavailable)
+
     def test_first_service_failure_disables_further_uploads(self):
         from ghbackup.archive import DriveUnavailable
 
@@ -203,7 +228,10 @@ class ReviewFaults(unittest.TestCase):
             atomic_json(resource / "data.json", {"body": "valid"})
             atomic_json(resource.parent / "source.json", repository())
             validate_metadata(resource)
-            atomic_json(folder / "capture.json", {"repo_id": "10", "category": "metadata", "complete": True})
+            atomic_json(
+                folder / "capture.json",
+                {"repo_id": "10", "category": "metadata", "complete": True},
+            )
         (self.c.root / "drive-queue/broken/capture.json").write_text("broken JSON")
         with patch("ghbackup.controller.Archive", return_value=self.archive):
             errors = self.ctrl.drain_queue()

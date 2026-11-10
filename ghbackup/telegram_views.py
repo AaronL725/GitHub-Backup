@@ -258,7 +258,9 @@ HELP = (
 RESTORE = (
     "🧰 <b>独立恢复</b>\n\n日常代码可从朋友账号的私密副本 clone。"
     "旧历史及相关数据从 Drive 明文目录和恢复点清单恢复。\n\n"
-    "<pre>ghbackup snapshots\nghbackup restore --repo-id ID --target /restore/recovered-ID</pre>\n"
+    "在 /opt/github-backup 下执行：\n"
+    "<pre>docker compose exec scheduler python -m ghbackup snapshots\n"
+    "docker compose exec scheduler python -m ghbackup restore --repo-id ID --target /restore/recovered-ID</pre>\n"
     "恢复目标必须是新目录；明文备份不需要解密密码。Bot 不传输代码或凭据。"
     "\n\n使用 /drill 可在 VPS 上验证归档恢复能力。"
 )

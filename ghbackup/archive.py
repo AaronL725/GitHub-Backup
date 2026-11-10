@@ -129,9 +129,9 @@ class Archive:
                 "invalid_grant",
                 "unauthorized",
             )
-            if result.returncode == 5 or any(
-                message in result.stderr.lower() for message in service_errors
-            ):
+            detail = result.stderr.lower()
+            provider_error = detail.partition("googleapi: error")[2]
+            if any(message in provider_error for message in service_errors) or '"invalid_grant"' in detail:
                 raise DriveUnavailable(
                     "Drive service, quota or authorization unavailable"
                 )
