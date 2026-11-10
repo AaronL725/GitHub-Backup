@@ -20,6 +20,10 @@ from .storage import Storage
 FORMAT = "ghbackup-plain-files-v1"
 
 
+class DriveUnavailable(BackupError):
+    pass
+
+
 def hashes(path):
     sha, md5 = hashlib.sha256(), hashlib.md5()
     with path.open("rb") as stream:
@@ -105,16 +109,32 @@ class Archive:
         return self.remote + "/" + str(relative).lstrip("/")
 
     def command(self, *args, missing=False):
-        result = subprocess.run(
-            ["rclone", *map(str, args)],
-            capture_output=True,
-            text=True,
-            env=self.env,
-            timeout=self.config.command_timeout_seconds,
-        )
+        try:
+            result = subprocess.run(
+                ["rclone", *map(str, args)],
+                capture_output=True,
+                text=True,
+                env=self.env,
+                timeout=self.config.command_timeout_seconds,
+            )
+        except subprocess.TimeoutExpired:
+            raise DriveUnavailable("Drive operation timed out") from None
         if missing and result.returncode in (3, 4):
             return None
         if result.returncode:
+            service_errors = (
+                "storagequotaexceeded",
+                "dailylimitexceeded",
+                "ratelimitexceeded",
+                "invalid_grant",
+                "unauthorized",
+            )
+            if result.returncode == 5 or any(
+                message in result.stderr.lower() for message in service_errors
+            ):
+                raise DriveUnavailable(
+                    "Drive service, quota or authorization unavailable"
+                )
             raise BackupError(
                 f"Drive operation failed (rclone exit {result.returncode})"
             )

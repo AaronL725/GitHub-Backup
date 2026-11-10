@@ -5,10 +5,72 @@ from __future__ import annotations
 import argparse
 import logging
 import re
+import os
 from pathlib import Path
 import sys
 
 from .common import BackupError, Config, atomic_json, read_json, sha256
+
+
+def recover_rename(output):
+    journal = output.parent / "metadata-rename.json"
+    if not journal.exists():
+        return
+    intent = read_json(journal)
+    old, new = (output / "repositories" / intent[k] for k in ("old", "new"))
+    if old.exists():
+        old.rename(new)
+        fd = os.open(new.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    for relative, checksums in intent["inventories"].items():
+        manifest = output.parent / relative
+        for name, digest in checksums.items():
+            file = manifest.parent / name
+            if not file.is_file() or sha256(file) != digest:
+                raise BackupError(
+                    "Interrupted metadata rename failed integrity verification"
+                )
+        atomic_json(manifest, checksums)
+    journal.unlink()
+    fd = os.open(journal.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def rename_export(output, name):
+    recover_rename(output)
+    repos = output / "repositories"
+    previous = [p for p in repos.iterdir() if p.is_dir()] if repos.exists() else []
+    if len(previous) > 1:
+        raise BackupError("Ambiguous metadata directories; refusing to merge")
+    if not previous or previous[0].name == name:
+        return
+    inventories = {}
+    for manifest in (output / "checksums.json", output.parent / "checksums.json"):
+        if manifest.exists():
+            verify_checksums(manifest.parent)
+            prefix = str(previous[0].relative_to(manifest.parent)) + "/"
+            replacement = str((repos / name).relative_to(manifest.parent)) + "/"
+            inventories[str(manifest.relative_to(output.parent))] = {
+                replacement + key[len(prefix) :]
+                if key.startswith(prefix)
+                else key: digest
+                for key, digest in read_json(manifest).items()
+            }
+    atomic_json(
+        output.parent / "metadata-rename.json",
+        {
+            "old": previous[0].name,
+            "new": name,
+            "inventories": inventories,
+        },
+    )
+    recover_rename(output)
 
 
 def validate_metadata(root: Path):
@@ -64,6 +126,7 @@ def export(repo_file: Path, output: Path, token: str, *, full=False):
 
     repo = read_json(repo_file)
     output.mkdir(parents=True, exist_ok=True, mode=0o700)
+    recover_rename(output)
     # Supply exact repository identity to the existing exporter, avoiding an extra
     # account-wide scan and never using --all (hooks require broader permissions).
     token_option = "-f" if token.startswith("github_pat_") else "-t"
@@ -100,15 +163,7 @@ def export(repo_file: Path, output: Path, token: str, *, full=False):
     args = upstream.parse_args(flags)
     if (output / "checksums.json").exists():
         verify_checksums(output)
-    # Validate the old paths before applying a source repository rename.
-    repos_dir = output / "repositories"
-    if repos_dir.exists():
-        previous = [p for p in repos_dir.iterdir() if p.is_dir()]
-        wanted = repos_dir / repo["name"]
-        if len(previous) == 1 and previous[0] != wanted and not wanted.exists():
-            previous[0].rename(wanted)
-        elif len(previous) > 1:
-            raise BackupError("Ambiguous metadata directories; refusing to merge")
+    rename_export(output, repo["name"])
 
     class Errors(logging.Handler):
         failed = False

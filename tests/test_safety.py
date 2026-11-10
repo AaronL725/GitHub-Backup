@@ -231,6 +231,11 @@ class ControllerSafetyTests(unittest.TestCase):
     def test_ready_capture_is_pinned_locally_when_drive_fails(self):
         entry = self.ctrl.state["repositories"]["10"]
         self.ctrl.begin("10", entry, "git")
+        from ghbackup.git import Git
+
+        folder = self.c.root / "repos/10/git"
+        Git().command("init", "--bare", folder / "repository.git")
+        atomic_json(folder / "manifest.json", {"refs": {}, "lfs": [], "wiki_refs": {}})
         self.archive.fail = True
         with self.assertRaises(BackupError):
             self.ctrl.ready("10", entry)

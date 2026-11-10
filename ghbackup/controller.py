@@ -8,12 +8,13 @@ import os
 import tempfile
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import uuid
 
-from .archive import Archive
+from .archive import Archive, DriveUnavailable
 from .common import BackupError, atomic_json, read_json, run, utcnow
-from .exporter import validate_metadata, verify_checksums
+from .exporter import validate_metadata, verify_checksums, recover_rename
 from .git import Git, github_clone_url
 from .github import GitHub, backup_releases, check_write_cooldown
 from .storage import Storage
@@ -75,6 +76,7 @@ class Controller:
         )
         self._audit_cache = {}
         self._drive_available = True
+        self._restore_errors = []
 
     def save(self):
         atomic_json(self.root / "state.json", self.state)
@@ -286,7 +288,7 @@ class Controller:
         (folder / pending["category"]).mkdir(parents=True, exist_ok=True, mode=0o700)
         if not (folder / "source.json").exists():
             atomic_json(folder / "source.json", entry["source"])
-        if entry.get("drive_pending"):
+        if entry.get("drive_pending") or not self._drive_available:
             self.queue_capture(rid, entry)
             raise BackupError("Drive backlog retained; new capture queued in order")
         try:
@@ -294,6 +296,13 @@ class Controller:
                 rid, pending["category"], complete=pending["ready"]
             )
         except Exception as exc:
+            if isinstance(exc, DriveUnavailable):
+                self._drive_available = False
+            else:
+                try:
+                    self.archive.available()
+                except Exception:
+                    self._drive_available = False
             self.queue_capture(rid, entry)
             message = str(exc) if isinstance(exc, BackupError) else type(exc).__name__
             raise BackupError(message) from None
@@ -370,33 +379,114 @@ class Controller:
             ),
             key=lambda p: p.stat().st_mtime_ns,
         )
-        remaining = {}
+        errors, blocked = [], set()
+        jobs = []
         for folder in folders:
-            rid = read_json(folder / "capture.json")["repo_id"]
-            remaining[rid] = remaining.get(rid, 0) + 1
-            self.state["repositories"][rid]["drive_pending"] = True
+            ids = [p.name for p in (folder / "repos").glob("*")]
+            for rid in ids:
+                if rid in self.state["repositories"]:
+                    self.state["repositories"][rid]["drive_pending"] = True
+            try:
+                capture = read_json(folder / "capture.json")
+                rid = capture["repo_id"]
+                if (
+                    ids != [rid]
+                    or rid not in self.state["repositories"]
+                    or capture["category"] not in ("git", "metadata")
+                    or type(capture["complete"]) is not bool
+                ):
+                    raise BackupError("Queue repository identity mismatch")
+                jobs.append((folder, capture))
+            except Exception as exc:
+                blocked.update(ids)
+                errors.append(
+                    {"stage": "queue", "task": folder.name, "error": type(exc).__name__}
+                )
         self.save()
-        for folder in folders:
-            capture = read_json(folder / "capture.json")
+        for folder, capture in jobs:
+            rid = capture["repo_id"]
+            if rid in blocked:
+                continue
+            try:
+                source = read_json(folder / "repos" / rid / "source.json", {})
+                if type(source.get("id")) is not int or str(source["id"]) != rid:
+                    raise BackupError("Queued source repository identity mismatch")
+                if capture["complete"]:
+                    resource = folder / "repos" / rid / capture["category"]
+                    required = (
+                        "manifest.json"
+                        if capture["category"] == "git"
+                        else "checksums.json"
+                    )
+                    if not (resource / required).is_file():
+                        raise BackupError(
+                            "Completed queue capture is missing its manifest"
+                        )
+                    verify_restored(folder, rid)
+            except Exception as exc:
+                blocked.add(rid)
+                errors.append(
+                    {
+                        "repo_id": rid,
+                        "stage": "queue",
+                        "task": folder.name,
+                        "error": str(exc)
+                        if isinstance(exc, BackupError)
+                        else type(exc).__name__,
+                    }
+                )
+                continue
             config = copy.copy(self.c)
             config.data_dir = str(folder)
-            if capture["complete"]:
-                verify_restored(folder, capture["repo_id"])
-            snapshot = Archive(config).backup(
-                capture["repo_id"], capture["category"], complete=capture["complete"]
-            )
-            entry = self.state["repositories"][capture["repo_id"]]
+            try:
+                snapshot = Archive(config).backup(
+                    rid, capture["category"], complete=capture["complete"]
+                )
+            except Exception as exc:
+                blocked.add(rid)
+                errors.append(
+                    {
+                        "repo_id": rid,
+                        "stage": "queue",
+                        "task": folder.name,
+                        "error": str(exc)
+                        if isinstance(exc, BackupError)
+                        else type(exc).__name__,
+                    }
+                )
+                if isinstance(exc, DriveUnavailable):
+                    self._drive_available = False
+                else:
+                    try:
+                        self.archive.available()
+                    except Exception:
+                        self._drive_available = False
+                if not self._drive_available:
+                    errors.append(
+                        {
+                            "stage": "archive",
+                            "error": "Drive unavailable; remaining uploads deferred",
+                        }
+                    )
+                    break
+                continue
+            entry = self.state["repositories"][rid]
             if capture["complete"]:
                 entry[capture["category"] + "_snapshot"] = snapshot
                 entry[capture["category"] + "_archived_at"] = utcnow()
-            remaining[capture["repo_id"]] -= 1
-            if not remaining[capture["repo_id"]]:
-                entry.pop("drive_pending", None)
             self.save()
             shutil.rmtree(folder)
-        for entry in self.state["repositories"].values():
-            entry.pop("drive_pending", None)
+        remaining = set()
+        for folder in (self.root / "drive-queue").glob("*"):
+            if not folder.name.startswith("."):
+                remaining.update(p.name for p in (folder / "repos").glob("*"))
+        for rid, entry in self.state["repositories"].items():
+            if rid in remaining:
+                entry["drive_pending"] = True
+            else:
+                entry.pop("drive_pending", None)
         self.save()
+        return errors
 
     def begin(self, rid, entry, category, *, full=False):
         if entry.get("pending"):
@@ -497,15 +587,54 @@ class Controller:
         self.save()
 
     def collect_metadata(self, rid, entry, *, full=False):
-        if (
-            self.c.evict_completed_cache
-            and not (self.root / "repos" / rid / "metadata").exists()
-            and entry.get("metadata_snapshot")
-        ):
-            if self._drive_available:
-                self.hydrate(rid, entry, "metadata")
+        root = self.root / "repos" / rid
+        metadata, baseline = root / "metadata", root / ".metadata-baseline"
+        transaction = root / "metadata-transaction.json"
+        shutil.rmtree(root / ".metadata-baseline-building", ignore_errors=True)
+        if baseline.exists():
+            if not read_json(transaction, {}).get("ready", False):
+                shutil.rmtree(metadata, ignore_errors=True)
+                baseline.rename(metadata)
             else:
-                full = True
+                shutil.rmtree(baseline)
+        if not metadata.exists() and entry.get("metadata_snapshot"):
+            if not self._drive_available:
+                raise BackupError(
+                    "Historical metadata unavailable; collection paused until Drive recovers"
+                )
+            self.hydrate(rid, entry, "metadata")
+        recover_rename(metadata / "export")
+        if (metadata / "checksums.json").exists():
+            verify_checksums(metadata)
+            Storage(self.c).ensure_space(
+                sum(p.stat().st_size for p in metadata.rglob("*") if p.is_file())
+            )
+            building = root / ".metadata-baseline-building"
+            shutil.rmtree(building, ignore_errors=True)
+            shutil.copytree(metadata, building)
+            building.rename(baseline)
+            subprocess.run(["sync", "-f", str(baseline)], check=True)
+            atomic_json(transaction, {"ready": False})
+        try:
+            self._collect_metadata(rid, entry, full=full)
+        except Exception:
+            pending = entry.get("pending")
+            if baseline.exists() and pending and not pending["ready"]:
+                try:
+                    self.flush(rid, entry)
+                except BackupError:
+                    if entry.get("pending"):
+                        raise
+                shutil.rmtree(metadata)
+                baseline.rename(metadata)
+            elif baseline.exists():
+                shutil.rmtree(baseline)
+            raise
+        else:
+            shutil.rmtree(baseline, ignore_errors=True)
+        transaction.unlink(missing_ok=True)
+
+    def _collect_metadata(self, rid, entry, *, full=False):
         existing = self.root / "repos" / rid / "metadata"
         if (existing / "checksums.json").exists():
             verify_checksums(existing)
@@ -551,6 +680,8 @@ class Controller:
         )
         # Include coverage.json itself in the checksum inventory.
         checksums = validate_metadata(metadata)
+        if (root / ".metadata-baseline").exists():
+            atomic_json(root / "metadata-transaction.json", {"ready": True})
         content = {
             name: digest
             for name, digest in checksums.items()
@@ -638,6 +769,62 @@ class Controller:
 
     def hydrate(self, rid, entry, category):
         Storage(self.c).ensure_space()
+        if category == "git":
+            manifest = read_json(self.root / "repos" / rid / "git/manifest.json")
+            try:
+                if self._drive_available:
+                    return self.hydrate_drive(rid, entry, category)
+            except Exception as exc:
+                self._restore_errors.append(
+                    {
+                        "repo_id": rid,
+                        "stage": "archive_restore",
+                        "error": str(exc)
+                        if isinstance(exc, BackupError)
+                        else type(exc).__name__,
+                    }
+                )
+            with tempfile.TemporaryDirectory(prefix=".hydrate-", dir=self.root) as t:
+                target = Path(t) / "repos" / rid / "git"
+                url = github_clone_url(entry["source"])
+                self.source_git.fetch(
+                    url, target / "repository.git", manifest.get("default_branch")
+                )
+                lfs = self.source_git.lfs(target / "repository.git")
+                if (
+                    self.source_git.refs(target / "repository.git") != manifest["refs"]
+                    or lfs != manifest["lfs"]
+                ):
+                    raise BackupError(
+                        "Source no longer matches captured Git version; repair refused"
+                    )
+                if manifest.get("wiki_refs"):
+                    self.source_git.fetch(
+                        url[:-4] + ".wiki.git", target / "wiki.git", "master"
+                    )
+                    self.source_git.lfs(target / "wiki.git")
+                    if (
+                        self.source_git.refs(target / "wiki.git")
+                        != manifest["wiki_refs"]
+                    ):
+                        raise BackupError(
+                            "Source Wiki no longer matches captured version"
+                        )
+                atomic_json(target / "manifest.json", manifest)
+                verify_restored(Path(t), rid)
+                folder = self.root / "repos" / rid / "git"
+                folder.mkdir(parents=True, exist_ok=True)
+                for path in target.iterdir():
+                    destination = folder / path.name
+                    if destination.is_dir():
+                        shutil.rmtree(destination)
+                    elif destination.exists():
+                        destination.unlink()
+                    shutil.move(path, destination)
+            return
+        return self.hydrate_drive(rid, entry, category)
+
+    def hydrate_drive(self, rid, entry, category):
         with tempfile.TemporaryDirectory(prefix=".hydrate-", dir=self.root) as t:
             target = Path(t) / "restore"
             self.archive.restore(
@@ -646,6 +833,11 @@ class Controller:
             verify_restored(target, rid)
             source = target / "repos" / rid / category
             if category == "git":
+                expected = read_json(self.root / "repos" / rid / "git/manifest.json")
+                if read_json(source / "manifest.json") != expected:
+                    raise BackupError(
+                        "Drive Git point does not match captured manifest"
+                    )
                 shutil.rmtree(source / "code", ignore_errors=True)
                 folder = self.root / "repos" / rid / "git"
                 folder.mkdir(parents=True, exist_ok=True)
@@ -682,11 +874,12 @@ class Controller:
     def sync(self, kind="all", *, full=False, yield_lock=None):
         self.recovery_files()
         errors = []
+        self._restore_errors = []
         self._audit_cache = {}
         try:
             self.archive.available()
             self._drive_available = True
-            self.drain_queue()
+            errors.extend(self.drain_queue() or [])
         except Exception as exc:
             self._drive_available = False
             errors.append(
@@ -848,6 +1041,7 @@ class Controller:
                     errors.append(
                         {"repo_id": rid, "stage": "cleanup", "error": str(exc)}
                     )
+        errors.extend(self._restore_errors)
         self.record_run(kind, errors)
         if errors:
             raise BackupError(

@@ -131,6 +131,29 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(self.git.refs(target), self.git.refs(self.work))
         self.assertFalse((self.repo / "git/repository.git").exists())
 
+        self.git.command(
+            "-C",
+            target,
+            "update-ref",
+            "refs/heads/offline-drift",
+            self.git.refs(target)["refs/heads/main"],
+        )
+        with (
+            patch.object(
+                self.archive, "available", side_effect=BackupError("Drive offline")
+            ),
+            patch.object(self.archive, "restore") as drive_restore,
+        ):
+            with self.assertRaises(BackupError):
+                controller.sync("git")
+            drive_restore.assert_not_called()
+        self.assertEqual(self.git.refs(target), self.git.refs(self.work))
+        (self.work / "README.md").write_text("uncaptured change\n")
+        self.commit()
+        controller._drive_available = False
+        with self.assertRaisesRegex(BackupError, "no longer matches"):
+            controller.hydrate("10", controller.state["repositories"]["10"], "git")
+
     def test_destination_outage_keeps_restorable_drive_capture_and_retries_publish(
         self,
     ):

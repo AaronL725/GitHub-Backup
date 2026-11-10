@@ -40,6 +40,9 @@ class Storage:
         for path in (self.c.root / "drive-queue").glob(".building-*"):
             shutil.rmtree(path)
             removed += 1
+        for path in self.c.root.glob("repos/*/.metadata-baseline-building"):
+            shutil.rmtree(path)
+            removed += 1
         # Explicit recovery exports expire; unfinished backup captures never do.
         output = Path("/restore")
         if self.c.local_storage_limit_bytes and output.exists():
