@@ -146,7 +146,7 @@ def status_card(view, config):
         ]
     lines += [
         "",
-        f"💾 本机剩余 <b>{view['disk_free'] / 1024**3:.1f} GiB</b>",
+        f"💾 工作盘剩余 <b>{view['disk_free'] / 1024**3:.1f} GiB</b>",
         f"🗃 已创建私密目标 <b>{view['targets']}</b> · 已有副本均保留",
         f"📤 Drive 待补传仓库 <b>{view['drive_pending']}</b>",
         "☁️ 明文文件 <code>Drive / GitHub-Backup</code>",

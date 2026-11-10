@@ -6,6 +6,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -14,6 +15,7 @@ import uuid
 
 from .common import BackupError, atomic_json, clean_env, read_json, sha256
 from .git import Git
+from .storage import Storage
 
 FORMAT = "ghbackup-plain-files-v1"
 
@@ -183,6 +185,8 @@ class Archive:
         self.command("check", local, self.path(remote), "--one-way", "--checksum")
 
     def backup(self, repo_id, category, *, complete):
+        # Upload existing captures using the reserve, so a full backlog can drain.
+        Storage(self.config).ensure_space(64 * 1024**2, reserve=False)
         source = self.config.root / "repos" / repo_id
         repo = read_json(source / "source.json")
         identifier = uuid.uuid4().hex
@@ -370,9 +374,14 @@ class Archive:
     def restore(self, repo_id, target, snapshot="latest", *, category=None):
         if target.exists():
             raise BackupError("Restore target must not exist")
+        if re.fullmatch(r"[0-9a-f]{32}", snapshot):
+            row = self.json(f"_系统/index/{repo_id}/{snapshot}.json")
+            candidates = [row] if row else []
+        else:
+            candidates = self.snapshots(repo_id)
         rows = [
             r
-            for r in self.snapshots(repo_id)
+            for r in candidates
             if r["repo_id"] == repo_id
             and r["complete"]
             and (snapshot == "latest" or r["id"].startswith(snapshot))
@@ -399,6 +408,9 @@ class Archive:
         target.mkdir(parents=True)
         for row in chosen:
             manifest = self.json(folder + "/" + row["control"] + "/manifest.json")
+            Storage(self.config).ensure_space(
+                sum(info["size"] for info in manifest["files"].values())
+            )
             history = None
             with tempfile.TemporaryDirectory(dir=self.config.root) as t:
                 stage = Path(t)

@@ -19,6 +19,104 @@ from test_safety import config, repository
     shutil.which("rclone") and shutil.which("git-lfs"), "Git LFS and rclone required"
 )
 class ArchiveTests(unittest.TestCase):
+    def test_evicted_metadata_restores_before_incremental_export_and_keeps_old_items(
+        self,
+    ):
+        from ghbackup.controller import Controller
+        from test_safety import Source, Destination
+        from unittest.mock import patch
+
+        self.c.evict_completed_cache = True
+        controller = Controller(
+            self.c, source=Source(), destination=Destination(), archive=self.archive
+        )
+        controller.identities()
+        controller.discover()
+        entry = controller.state["repositories"]["10"]
+        metadata = self.repo / "metadata"
+        atomic_json(
+            metadata / "export/repositories/project/issues/1.json",
+            {"body": "deleted upstream later"},
+        )
+        validate_metadata(metadata / "export")
+        validate_metadata(metadata)
+        entry["metadata_snapshot"] = self.archive.backup(
+            "10", "metadata", complete=True
+        )
+        controller.evict_cache("10", entry)
+        self.assertFalse(metadata.exists())
+
+        def incremental(*args, **kwargs):
+            atomic_json(
+                metadata / "export/repositories/project/issues/2.json", {"body": "new"}
+            )
+            validate_metadata(metadata / "export")
+            return ""
+
+        with (
+            patch("ghbackup.controller.run", side_effect=incremental),
+            patch("ghbackup.controller.backup_releases"),
+        ):
+            controller.collect_metadata("10", entry)
+        controller.evict_cache("10", entry)
+        self.assertFalse(metadata.exists())
+        target = self.base / "metadata-after-eviction"
+        self.archive.restore("10", target, category="metadata")
+        verify_restored(target, "10")
+        issues = target / "repos/10/metadata/export/repositories/project/issues"
+        self.assertTrue((issues / "1.json").exists())
+        self.assertTrue((issues / "2.json").exists())
+
+    def test_evicted_git_cache_skips_unchanged_and_repairs_target_drift_from_drive(
+        self,
+    ):
+        from ghbackup.controller import Controller
+        from test_safety import Source, Destination
+
+        target = self.base / "evicted-target.git"
+        self.git.command("init", "--bare", "--initial-branch=main", target)
+        mapping = {
+            "https://github.com/alice/project.git": str(self.work),
+            "https://github.com/bob/project--10.git": str(target),
+        }
+
+        class LocalGit(Git):
+            def command(inner, *args, **kwargs):
+                return super().command(
+                    *(mapping.get(str(a), a) for a in args), **kwargs
+                )
+
+        self.c.evict_completed_cache = True
+        controller = Controller(
+            self.c, source=Source(), destination=Destination(), archive=self.archive
+        )
+        controller.source_git = LocalGit()
+        controller.destination_git = LocalGit()
+        controller.sync("git")
+        self.assertFalse((self.repo / "git/repository.git").exists())
+        first = self.archive.snapshots("10")[-1]["id"]
+        controller.sync("git")
+        self.assertEqual(len(self.archive.snapshots("10")), 1)
+        self.git.command(
+            "-C",
+            target,
+            "update-ref",
+            "refs/heads/unwanted",
+            self.git.refs(target)["refs/heads/main"],
+        )
+        controller.sync("git")
+        self.assertEqual(self.git.refs(target), self.git.refs(self.work))
+        self.assertFalse((self.repo / "git/repository.git").exists())
+        (self.work / "README.md").write_text("updated after eviction\n")
+        self.commit()
+        controller.sync("git")
+        self.assertFalse((self.repo / "git/repository.git").exists())
+        self.archive.restore("10", self.base / "before-eviction", first, category="git")
+        self.assertEqual(
+            (self.base / "before-eviction/repos/10/git/code/README.md").read_text(),
+            "first version\n",
+        )
+
     def test_destination_outage_keeps_restorable_drive_capture_and_retries_publish(
         self,
     ):

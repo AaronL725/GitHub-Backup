@@ -269,6 +269,28 @@ class ControllerSafetyTests(unittest.TestCase):
         self.ctrl.collect_metadata.assert_called_once()
         self.assertTrue(self.ctrl.state["repositories"]["10"]["publish_pending"])
 
+    def test_metadata_handoff_reloads_git_progress_without_overwriting_it(self):
+        self.src.repos.append(repository(11, name="second"))
+        self.ctrl.collect_metadata = Mock()
+
+        def other_task():
+            state = read_json(self.c.root / "state.json")
+            state["repositories"]["10"]["git_checked_at"] = "other-task-progress"
+            state.setdefault("runs", {})["git"] = {
+                "at": "other-task-time",
+                "errors": [],
+            }
+            atomic_json(self.c.root / "state.json", state)
+
+        handoff = Mock(side_effect=other_task)
+        self.ctrl.sync("metadata", yield_lock=handoff)
+        handoff.assert_called_once()
+        saved = read_json(self.c.root / "state.json")
+        self.assertEqual(
+            saved["repositories"]["10"]["git_checked_at"], "other-task-progress"
+        )
+        self.assertEqual(saved["runs"]["git"]["at"], "other-task-time")
+
     def test_protected_or_unavailable_target_does_not_block_source(self):
         entry = self.ctrl.state["repositories"]["10"]
         target = self.ctrl.ensure_target("10", entry)

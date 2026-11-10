@@ -264,6 +264,17 @@ class Control:
         while True:
             try:
                 view = snapshot(self.config)
+                # Send before SQLite writes, so a full work disk can still alert.
+                if (
+                    view["disk_free"] < self.config.minimum_free_bytes
+                    and time.time() - getattr(self, "storage_alert_at", 0)
+                    >= self.config.telegram_reminder_seconds
+                ):
+                    await self.send(
+                        app.bot,
+                        "🔴 <b>本地备份工作盘空间不足</b>\n\n新增采集将暂停；未补传数据继续保留。请检查 Drive 连接或调整工作盘容量。",
+                    )
+                    self.storage_alert_at = time.time()
                 self.store.sample(view)
                 for event in self.store.pending():
                     if event["kind"] == "deployment":

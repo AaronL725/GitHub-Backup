@@ -63,6 +63,12 @@ def serve(config, config_path):
     )
     scheduler.add_job(
         run,
+        CronTrigger(minute=9, timezone=config.telegram_timezone),
+        args=["cleanup", ["cleanup"]],
+        id="cleanup",
+    )
+    scheduler.add_job(
+        run,
         CronTrigger(
             day_of_week="sun", hour=4, minute=17, timezone=config.telegram_timezone
         ),

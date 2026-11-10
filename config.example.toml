@@ -17,7 +17,11 @@ telegram_timezone = "Asia/Shanghai"
 
 # Container paths; normal deployments do not need to change these.
 data_dir = "/var/lib/ghbackup"
-minimum_free_bytes = 5368709120
+minimum_free_bytes = 1073741824
+# Hard filesystem limit; provision it with scripts/setup-storage.py before Compose.
+local_storage_limit_bytes = 8000000000
+evict_completed_cache = true
+restore_retention_hours = 24
 include_repo_ids = []
 empty_wiki_ids = []
 # Set true only after confirming repositories have never used Wiki.

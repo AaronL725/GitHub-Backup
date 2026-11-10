@@ -119,7 +119,7 @@ def exclusive(root: Path, *, wait=False):
             raise BackupError(
                 "Another backup/verify/restore operation is running"
             ) from None
-        yield
+        yield lock
 
 
 @dataclasses.dataclass
@@ -136,6 +136,9 @@ class Config:
     telegram_token: str = dataclasses.field(default="", repr=False)
     telegram_user_id: int = 0
     minimum_free_bytes: int = 5 * 1024**3
+    local_storage_limit_bytes: int = 0
+    evict_completed_cache: bool = False
+    restore_retention_hours: int = 24
     command_timeout_seconds: int = 14400
     http_timeout_seconds: int = 60
     api_retries: int = 5
@@ -230,6 +233,18 @@ class Config:
             raise BackupError("Private config must be outside data_dir")
         if c.minimum_free_bytes < 0 or c.api_retries < 0 or c.api_retries > 10:
             raise BackupError("Invalid limits")
+        if (
+            type(c.local_storage_limit_bytes) is not int
+            or c.local_storage_limit_bytes < 0
+            or type(c.evict_completed_cache) is not bool
+            or type(c.restore_retention_hours) is not int
+            or c.restore_retention_hours < 1
+            or (
+                c.local_storage_limit_bytes
+                and c.minimum_free_bytes >= c.local_storage_limit_bytes
+            )
+        ):
+            raise BackupError("Invalid local storage budget")
         if (
             c.destination_write_cooldown_seconds < 60
             or c.telegram_reminder_seconds < 60

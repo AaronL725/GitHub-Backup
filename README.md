@@ -21,10 +21,19 @@ cp config.example.toml config.toml
 mkdir -p data restore
 chown -R 10001:10001 config.toml data restore
 chmod 600 config.toml
-docker compose up -d --build
+docker compose build
+python3 scripts/setup-storage.py        # root：配置有硬上限的工作盘及启动顺序
 ```
 
-`data/` 保存工作数据和自动生成的运行缓存，`restore/` 保存恢复导出。`data/runtime/rclone.conf` 是程序维护的 OAuth 缓存，不需要单独配置或提交。真实配置只读挂载进容器，不会写入镜像或备份恢复模板。
+`storage.img` 是最多 8,000,000,000 字节的稀疏 ext4 工作盘，按实际使用占空间，包含全部运行数据和恢复输出；文件系统从内核限制容量。每 5 分钟回收空闲块，`du -h storage.img` 可查看实际占用，`ls -lh` 显示的是容量上限。`data/`、`restore/` 是指向该盘的兼容入口。工作盘未挂载时容器拒绝写入，不会回退到 VPS 主盘。Docker 镜像、构建缓存及轮转日志属于额外系统开销。
+
+成功备份后自动删除本地 Git 和元数据缓存，只留仓库清单、Git refs、凭据缓存和任务状态。源 Git refs 未变化时不重新下载；变化时重新拉取 Git，元数据按需从 Drive 恢复再增量导出，修复目标仓库时也可从 Drive 取回 Git。因此更省本地空间，但下载流量和同步耗时会增加。
+
+元数据同步在仓库之间交还文件锁，让等待的 Git 任务先运行；重新获得锁后重载状态，避免覆盖另一任务的进度。
+
+每次备份/恢复前及每小时自动清理中断遗留的临时目录。恢复导出默认保留 24 小时，可通过 `restore_retention_hours` 修改；有用的恢复文件应及时移出。未完成采集、未补传版本及待发布 Git 缓存不因清理而删除。剩余不足 `minimum_free_bytes`（默认 1 GiB）时停止新采集并告警；内核硬上限同时约束单次大文件写入。Drive 历史不设容量或保留期上限。
+
+`data/runtime/rclone.conf` 是程序维护的 OAuth 缓存，不需要单独配置或提交。真实配置只读挂载进容器，不会写入镜像或备份恢复模板。手动执行清理可用 `docker compose exec scheduler python -m ghbackup --wait-lock cleanup`。
 
 源账号只读；朋友账号原有仓库的 ID 记录在 `protected_destination_ids`，禁止修改。新备份仓库独立创建为 Private。按源仓库 ID 跟踪更名；源删除或不可访问时保留已有备份。GitHub 限流时暂停目标写入，Drive 备份继续。
 
@@ -63,6 +72,8 @@ docker compose exec scheduler python -m ghbackup restore --repo-id 仓库ID --ta
 ```
 
 恢复会结合当前文件、旧文件和校验清单重建所选版本，然后验证 Git/LFS 和元数据。导出目录在宿主机 `restore/` 中。明文备份不需要解密密码，也不需要源 GitHub 账号；新机器重新授权 Drive 后即可恢复。
+
+在仅用于恢复的新机器上，填写 Drive 凭据并构建镜像，执行 `python3 scripts/setup-storage.py --no-start` 准备工作盘，再用 `docker compose run --rm scheduler restore ...` 恢复；不需要 GitHub Token，也不启动后台备份。
 
 只有完整恢复点作为默认恢复来源；失败采集单独保留。只能恢复已经捕获的版本，不能补回安装前已丢失或两次采集之间立即删除的数据。GitHub 不允许完整重建原作者、时间和历史 PR 合并状态，因此相关数据保存为原始 JSON/附件。Actions Secrets 原值、Packages 和外部依赖不在采集范围。
 

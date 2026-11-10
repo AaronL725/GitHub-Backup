@@ -5,6 +5,7 @@ import datetime as dt
 import importlib.util
 import json
 import os
+import tempfile
 from pathlib import Path
 import shutil
 import sys
@@ -15,6 +16,7 @@ from .common import BackupError, atomic_json, read_json, run, utcnow
 from .exporter import validate_metadata, verify_checksums
 from .git import Git, github_clone_url
 from .github import GitHub, backup_releases, check_write_cooldown
+from .storage import Storage
 
 
 UNSUPPORTED = {
@@ -72,6 +74,7 @@ class Controller:
             ),
         )
         self._audit_cache = {}
+        self._drive_available = True
 
     def save(self):
         atomic_json(self.root / "state.json", self.state)
@@ -314,6 +317,7 @@ class Controller:
         pending = entry["pending"]
         category = pending["category"]
         source = self.root / "repos" / rid / category
+        Storage(self.c).ensure_space()
         queue = self.root / "drive-queue" / (".building-" + uuid.uuid4().hex)
         queue.mkdir(parents=True, mode=0o700)
 
@@ -397,10 +401,7 @@ class Controller:
     def begin(self, rid, entry, category, *, full=False):
         if entry.get("pending"):
             raise BackupError("Unarchived previous capture; collection refused")
-        if shutil.disk_usage(self.root).free < self.c.minimum_free_bytes:
-            raise BackupError(
-                "Insufficient free disk space; history will not be deleted"
-            )
+        Storage(self.c).ensure_space()
         (self.root / "repos" / rid).mkdir(parents=True, exist_ok=True, mode=0o700)
         entry["pending"] = {
             "category": category,
@@ -464,6 +465,13 @@ class Controller:
             entry["git_checked_at"] = utcnow()
             self.save()
             return
+        if (
+            self.c.evict_completed_cache
+            and wiki_refs
+            and wiki_status == "unavailable_or_uninitialized"
+            and not (folder / "wiki.git").exists()
+        ):
+            self.hydrate(rid, entry, "git")
         self.begin(rid, entry, "git")
         entry["git_retry"] = True
         self.save()
@@ -489,6 +497,15 @@ class Controller:
         self.save()
 
     def collect_metadata(self, rid, entry, *, full=False):
+        if (
+            self.c.evict_completed_cache
+            and not (self.root / "repos" / rid / "metadata").exists()
+            and entry.get("metadata_snapshot")
+        ):
+            if self._drive_available:
+                self.hydrate(rid, entry, "metadata")
+            else:
+                full = True
         existing = self.root / "repos" / rid / "metadata"
         if (existing / "checksums.json").exists():
             verify_checksums(existing)
@@ -570,6 +587,8 @@ class Controller:
             raise BackupError("Publishing requires a completed durable capture")
         target = self.ensure_target(rid, entry)
         folder = self.root / "repos" / rid / "git" / "repository.git"
+        if not folder.exists() and self.c.evict_completed_cache:
+            self.hydrate(rid, entry, "git")
         manifest = read_json(folder.parent / "manifest.json")
         if self.source_git.refs(folder) != manifest["refs"]:
             raise BackupError("Local refs changed after archival")
@@ -617,14 +636,63 @@ class Controller:
         entry["published_at"] = utcnow()
         self.save()
 
-    def sync(self, kind="all", *, full=False):
+    def hydrate(self, rid, entry, category):
+        Storage(self.c).ensure_space()
+        with tempfile.TemporaryDirectory(prefix=".hydrate-", dir=self.root) as t:
+            target = Path(t) / "restore"
+            self.archive.restore(
+                rid, target, entry[category + "_snapshot"], category=category
+            )
+            verify_restored(target, rid)
+            source = target / "repos" / rid / category
+            if category == "git":
+                shutil.rmtree(source / "code", ignore_errors=True)
+                folder = self.root / "repos" / rid / "git"
+                folder.mkdir(parents=True, exist_ok=True)
+                for path in source.iterdir():
+                    destination = folder / path.name
+                    if destination.exists():
+                        if destination.is_dir():
+                            shutil.rmtree(destination)
+                        else:
+                            destination.unlink()
+                    shutil.move(path, destination)
+            else:
+                shutil.move(source, self.root / "repos" / rid / category)
+
+    def evict_cache(self, rid, entry):
+        if (
+            not self.c.evict_completed_cache
+            or entry.get("pending")
+            or entry.get("drive_pending")
+        ):
+            return
+        root = self.root / "repos" / rid
+        if (
+            entry.get("git_snapshot")
+            and not entry.get("git_retry")
+            and not entry.get("publish_pending")
+        ):
+            for name in ("repository.git", "wiki.git", "code"):
+                shutil.rmtree(root / "git" / name, ignore_errors=True)
+        if (
+            entry.get("metadata_snapshot")
+            and not entry.get("metadata_force_full")
+            and (root / "metadata").exists()
+        ):
+            verify_checksums(root / "metadata")
+            shutil.rmtree(root / "metadata")
+
+    def sync(self, kind="all", *, full=False, yield_lock=None):
         self.recovery_files()
         errors = []
         self._audit_cache = {}
         try:
             self.archive.available()
+            self._drive_available = True
             self.drain_queue()
         except Exception as exc:
+            self._drive_available = False
             errors.append(
                 {
                     "stage": "archive",
@@ -689,7 +757,12 @@ class Controller:
             and e["stage"] == "archive"
             and self.state["repositories"][e["repo_id"]].get("pending")
         }
-        for rid, entry in self.state["repositories"].items():
+        for index, rid in enumerate(list(self.state["repositories"])):
+            if index and yield_lock:
+                yield_lock()
+                self.state = read_json(self.root / "state.json")
+                self._audit_cache = {}
+            entry = self.state["repositories"][rid]
             if rid in blocked:
                 continue
             try:
@@ -736,9 +809,9 @@ class Controller:
                             )
                             expected = {
                                 k: v
-                                for k, v in self.source_git.refs(
-                                    self.root / "repos" / rid / "git" / "repository.git"
-                                ).items()
+                                for k, v in read_json(
+                                    self.root / "repos" / rid / "git/manifest.json"
+                                )["refs"].items()
                                 if k.startswith(("refs/heads/", "refs/tags/"))
                             }
                             actual = {
@@ -772,6 +845,12 @@ class Controller:
                     )
                     errors.append(
                         {"repo_id": rid, "stage": "publish", "error": message}
+                    )
+                try:
+                    self.evict_cache(rid, entry)
+                except BackupError as exc:
+                    errors.append(
+                        {"repo_id": rid, "stage": "cleanup", "error": str(exc)}
                     )
         self.record_run(kind, errors)
         if errors:

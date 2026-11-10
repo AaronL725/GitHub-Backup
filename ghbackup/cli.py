@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 from pathlib import Path
 import shutil
 import sys
 import tempfile
+import time
 
 from .archive import Archive
 from .common import (
@@ -20,6 +22,7 @@ from .common import (
 )
 from .controller import Controller, UNSUPPORTED, age_seconds, verify_restored
 from .github import GitHub
+from .storage import Storage
 
 
 def doctor(config):
@@ -94,6 +97,8 @@ def status(config, max_age=None):
     runs = state.get("runs", {"legacy": state.get("last_run", {})})
     errors = [e for report in runs.values() for e in report.get("errors", [])]
     unhealthy |= bool(errors)
+    disk = shutil.disk_usage(config.root)
+    unhealthy |= disk.free < config.minimum_free_bytes
     return {
         "healthy": not unhealthy,
         "repositories": rows,
@@ -101,6 +106,11 @@ def status(config, max_age=None):
         "task_runs": runs,
         "last_discovery": state.get("last_discovery"),
         "coverage_exclusions": UNSUPPORTED,
+        "storage": {
+            "limit_bytes": config.local_storage_limit_bytes,
+            "used_bytes": disk.used,
+            "free_bytes": disk.free,
+        },
     }
 
 
@@ -142,6 +152,9 @@ def parser():
     )
     sub.add_parser("telegram", help="Run the optional private Telegram control plane")
     sub.add_parser("scheduler", help="Run the Compose backup scheduler")
+    sub.add_parser(
+        "cleanup", help="Remove abandoned temporary files and completed local caches"
+    )
     restore = sub.add_parser(
         "restore", help="Restore files offline; never writes to GitHub"
     )
@@ -160,6 +173,8 @@ def main(argv=None):
     config, controller = None, None
     try:
         config = Config.load(args.config)
+        storage = Storage(config)
+        storage.validate()
         if args.command == "telegram":
             from .telegram_bot import serve
 
@@ -170,7 +185,12 @@ def main(argv=None):
 
             serve(config, args.config)
             return 0
-        with exclusive(config.root, wait=args.wait_lock):
+        with exclusive(config.root, wait=args.wait_lock) as lock:
+            if args.command in ("sync", "verify", "drill", "cleanup", "restore"):
+                removed = storage.cleanup()
+                atomic_json(
+                    config.root / "cleanup.json", {"at": utcnow(), "removed": removed}
+                )
             if args.command == "status":
                 report = status(config, args.max_age)
                 print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -224,7 +244,21 @@ def main(argv=None):
                 return 0
             if args.command == "sync":
                 controller = Controller(config)
-                controller.sync(args.kind, full=args.full)
+
+                def handoff():
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+                    time.sleep(0.1)
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+
+                controller.sync(
+                    args.kind,
+                    full=args.full,
+                    yield_lock=handoff if args.kind == "metadata" else None,
+                )
+            elif args.command == "cleanup":
+                controller = Controller(config)
+                for rid, entry in controller.state["repositories"].items():
+                    controller.evict_cache(rid, entry)
             else:
                 archive = Archive(config)
                 if args.command == "init-archive":
@@ -233,6 +267,12 @@ def main(argv=None):
                     print(json.dumps(archive.snapshots(), ensure_ascii=False, indent=2))
                 elif args.command == "restore":
                     target = args.target.resolve()
+                    if config.local_storage_limit_bytes and not target.is_relative_to(
+                        Path("/restore")
+                    ):
+                        raise BackupError(
+                            "Bounded restore output must be inside /restore"
+                        )
                     if target.is_relative_to(
                         config.root.resolve()
                     ) or config.root.resolve().is_relative_to(target):

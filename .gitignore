@@ -6,11 +6,15 @@ build/
 dist/
 config.toml
 secrets/
-data/
+/data
 .coverage
 .tools/
 bin/
 config/
 logs/
-restore/
+/restore
 .env
+storage/
+storage.img
+data.pre-storage/
+restore.pre-storage/

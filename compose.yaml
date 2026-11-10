@@ -10,11 +10,19 @@ x-common: &common
     - no-new-privileges:true
   cap_drop: [ALL]
   tmpfs:
-    - /tmp:mode=1777
+    - /tmp:mode=1777,size=256m
   volumes:
     - ./config.toml:/run/secrets/ghbackup.toml:ro
-    - ./data:/var/lib/ghbackup:rw
-    - ./restore:/restore:rw
+    - type: bind
+      source: ./storage/data
+      target: /var/lib/ghbackup
+      bind:
+        create_host_path: false
+    - type: bind
+      source: ./storage/restore
+      target: /restore
+      bind:
+        create_host_path: false
   environment:
     TZ: Asia/Shanghai
   stop_grace_period: 2m
