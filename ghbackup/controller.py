@@ -359,6 +359,8 @@ class Controller:
             },
         )
         queue.rename(queue.with_name(queue.name.removeprefix(".building-")))
+        # Persist files and the visible queue name before acknowledging capture.
+        subprocess.run(["sync", "-f", str(queue.parent)], check=True)
         if pending["ready"]:
             entry[category + "_local_capture"] = True
         entry["drive_pending"] = True
@@ -398,12 +400,15 @@ class Controller:
                     raise BackupError("Queue repository identity mismatch")
                 jobs.append((folder, capture))
             except Exception as exc:
-                blocked.update(ids)
+                jobs.append((folder, None))
                 errors.append(
                     {"stage": "queue", "task": folder.name, "error": type(exc).__name__}
                 )
         self.save()
         for folder, capture in jobs:
+            if capture is None:
+                blocked.update(p.name for p in (folder / "repos").glob("*"))
+                continue
             rid = capture["repo_id"]
             if rid in blocked:
                 continue
@@ -681,6 +686,7 @@ class Controller:
         # Include coverage.json itself in the checksum inventory.
         checksums = validate_metadata(metadata)
         if (root / ".metadata-baseline").exists():
+            subprocess.run(["sync", "-f", str(metadata)], check=True)
             atomic_json(root / "metadata-transaction.json", {"ready": True})
         content = {
             name: digest

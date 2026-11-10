@@ -195,3 +195,19 @@ class ReviewFaults(unittest.TestCase):
             self.ctrl.collect_metadata("10", self.ctrl.state["repositories"]["10"])
         verify_checksums(metadata)
         self.assertIn("newly captured", file.read_text())
+
+    def test_malformed_later_task_does_not_block_earlier_versions(self):
+        for name in ("first", "broken"):
+            folder = self.c.root / "drive-queue" / name
+            resource = folder / "repos/10/metadata"
+            atomic_json(resource / "data.json", {"body": "valid"})
+            atomic_json(resource.parent / "source.json", repository())
+            validate_metadata(resource)
+            atomic_json(folder / "capture.json", {"repo_id": "10", "category": "metadata", "complete": True})
+        (self.c.root / "drive-queue/broken/capture.json").write_text("broken JSON")
+        with patch("ghbackup.controller.Archive", return_value=self.archive):
+            errors = self.ctrl.drain_queue()
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(self.archive.captures, [("10", "metadata", True)])
+        self.assertFalse((self.c.root / "drive-queue/first").exists())
+        self.assertTrue((self.c.root / "drive-queue/broken").exists())
