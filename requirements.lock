@@ -1,2 +1,10 @@
-github-backup==0.67.0
-APScheduler==3.11.0
+# Fully pinned runtime dependencies; verified by pip --require-hashes.
+github-backup==0.67.0 \
+    --hash=sha256:d1a401ddd3531ab394a5a8de78df9ef3504e8b8a29a50992ae9e31e5556cbb11 \
+    --hash=sha256:dc112537678851d698037d07b4fbe3adc00cb3e8f1fc1f9a1c1ef8b3f1494086
+APScheduler==3.11.0 \
+    --hash=sha256:4c622d250b0955a65d5d0eb91c33e6d43fd879834bf541e0a18661ae60460133 \
+    --hash=sha256:fc134ca32e50f5eadcc4938e3a4545ab19131435e851abb40b34d63d5141c6da
+tzlocal==5.4.5 \
+    --hash=sha256:ba976898bad27945178c9ca25c222c19e322b30c10342b9f40b46714f70d2d5f \
+    --hash=sha256:ecab534f6d65d9deb4c4ea52c121ab6dd5958e9b878e71dcb102578269752454

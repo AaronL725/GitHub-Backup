@@ -1,0 +1,16 @@
+name: CI
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test-and-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Build production image
+        run: docker compose build
+      - name: Run isolated tests without production credentials
+        run: >-
+          docker run --rm --entrypoint python
+          -v "$PWD/tests:/app/tests:ro"
+          github-backup:local -m unittest discover -s tests -v

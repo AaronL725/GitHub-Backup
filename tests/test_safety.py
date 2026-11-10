@@ -218,30 +218,84 @@ class ControllerSafetyTests(unittest.TestCase):
             self.ctrl.state["repositories"]["10"]["source_status"], "accessible"
         )
 
-    def test_pending_archive_blocks_new_collection(self):
+    def test_partial_capture_is_preserved_without_blocking_other_resources(self):
         entry = self.ctrl.state["repositories"]["10"]
         self.ctrl.begin("10", entry, "git")
         self.archive.fail = True
         with self.assertRaises(BackupError):
             self.ctrl.flush("10", entry)
-        with self.assertRaisesRegex(BackupError, "Unarchived"):
-            self.ctrl.begin("10", entry, "metadata")
-        self.assertFalse(entry.get("publish_pending", False))
-        self.assertTrue(entry["pending"])
-        self.assertTrue((self.c.root / "repos/10/source.json").is_file())
+        self.assertNotIn("pending", entry)
+        self.assertFalse(entry.get("git_local_capture", False))
+        self.ctrl.begin("10", entry, "metadata")
 
-    def test_ready_capture_retries_without_recapture(self):
+    def test_ready_capture_is_pinned_locally_when_drive_fails(self):
         entry = self.ctrl.state["repositories"]["10"]
         self.ctrl.begin("10", entry, "git")
         self.archive.fail = True
         with self.assertRaises(BackupError):
             self.ctrl.ready("10", entry)
-        self.assertTrue(entry["pending"]["ready"])
-        self.archive.fail = False
-        self.ctrl.flush("10", entry)
         self.assertNotIn("pending", entry)
+        self.assertTrue(entry["git_local_capture"])
         self.assertTrue(entry["publish_pending"])
-        self.assertEqual(self.archive.captures, [("10", "git", True)])
+        self.assertTrue(entry["drive_pending"])
+        self.archive.fail = False
+        with patch("ghbackup.controller.Archive", return_value=self.archive):
+            self.ctrl.drain_queue()
+        self.assertFalse(entry.get("drive_pending"))
+        self.assertTrue(entry["git_snapshot"])
+
+    def test_destination_auth_failure_does_not_block_drive_collection(self):
+        self.dst.get = Mock(side_effect=BackupError("destination unavailable"))
+        self.ctrl.collect_git = Mock()
+        self.ctrl.collect_metadata = Mock()
+        with self.assertRaises(BackupError):
+            self.ctrl.sync("all")
+        self.ctrl.collect_git.assert_called_once()
+        self.ctrl.collect_metadata.assert_called_once()
+        self.assertTrue(self.ctrl.state["repositories"]["10"]["publish_pending"])
+
+    def test_protected_or_unavailable_target_does_not_block_source(self):
+        entry = self.ctrl.state["repositories"]["10"]
+        target = self.ctrl.ensure_target("10", entry)
+        self.c.protected_destination_ids = [target["id"]]
+        self.ctrl.collect_git = Mock()
+        self.ctrl.collect_metadata = Mock()
+        before = len(self.dst.calls)
+        with self.assertRaises(BackupError):
+            self.ctrl.sync("all")
+        self.ctrl.collect_git.assert_called_once()
+        self.ctrl.collect_metadata.assert_called_once()
+        self.assertEqual(before, len(self.dst.calls))
+
+    def test_wiki_manifest_uses_fetched_refs_not_initial_probe(self):
+        entry = self.ctrl.state["repositories"]["10"]
+        entry["source"]["has_wiki"] = True
+        main = {"refs/heads/main": "a" * 40}
+        old = {"refs/heads/master": "b" * 40}
+        new = {"refs/heads/master": "c" * 40}
+        git = Mock()
+        git.remote_refs.side_effect = [main, old, new]
+        git.refs.side_effect = lambda path: new if path.name == "wiki.git" else main
+        git.lfs.return_value = []
+        self.ctrl.source_git = git
+        self.ctrl.collect_git("10", entry)
+        manifest = read_json(self.c.root / "repos/10/git/manifest.json")
+        self.assertEqual(manifest["wiki_refs"], new)
+
+    def test_wiki_update_after_fetch_does_not_commit_a_mismatched_manifest(self):
+        entry = self.ctrl.state["repositories"]["10"]
+        entry["source"]["has_wiki"] = True
+        main = {"refs/heads/main": "a" * 40}
+        old = {"refs/heads/master": "b" * 40}
+        new = {"refs/heads/master": "c" * 40}
+        git = Mock()
+        git.remote_refs.side_effect = [main, old, new]
+        git.refs.side_effect = lambda path: old if path.name == "wiki.git" else main
+        git.lfs.return_value = []
+        self.ctrl.source_git = git
+        with self.assertRaisesRegex(BackupError, "Wiki refs changed"):
+            self.ctrl.collect_git("10", entry)
+        self.assertEqual(self.archive.captures, [])
 
     def test_partial_capture_not_marked_successful(self):
         entry = self.ctrl.state["repositories"]["10"]

@@ -98,6 +98,8 @@ def export(repo_file: Path, output: Path, token: str, *, full=False):
     if not full:
         flags.append("--incremental")
     args = upstream.parse_args(flags)
+    if (output / "checksums.json").exists():
+        verify_checksums(output)
 
     class Errors(logging.Handler):
         failed = False

@@ -32,8 +32,9 @@ def github_clone_url(repo):
 
 
 class Git:
-    def __init__(self, token="", timeout=14400):
+    def __init__(self, token="", timeout=14400, write_guard=None):
         self.timeout = timeout
+        self.write_guard = write_guard
         self.env = clean_env()
         self.env.update(
             GHBACKUP_TOKEN=token,
@@ -48,6 +49,8 @@ class Git:
         )
 
     def command(self, *args, cwd=None):
+        if self.write_guard and "push" in args:
+            self.write_guard()
         return run(
             [
                 "git",

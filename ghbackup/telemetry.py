@@ -31,6 +31,8 @@ class Store:
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                     created TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL,
                     delivered INTEGER NOT NULL DEFAULT 0);
+                CREATE INDEX IF NOT EXISTS events_pending ON events(sequence) WHERE delivered=0;
+                CREATE INDEX IF NOT EXISTS events_delivered ON events(created) WHERE delivered=1;
                 CREATE TABLE IF NOT EXISTS jobs (
                     id TEXT PRIMARY KEY, request_key TEXT UNIQUE NOT NULL,
                     kind TEXT NOT NULL, status TEXT NOT NULL, created TEXT NOT NULL,
@@ -152,6 +154,10 @@ class Store:
 
     def sample(self, view):
         with self.connect() as db, db:
+            cutoff = time.strftime(
+                "%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - 30 * 86400)
+            )
+            db.execute("DELETE FROM events WHERE delivered=1 AND created<?", (cutoff,))
             db.execute(
                 "INSERT OR IGNORE INTO samples VALUES (?,?,?,?,?,?)",
                 (

@@ -209,6 +209,15 @@ class Config:
         c.private_config_path = str(Path(path).resolve())
         import re
 
+        for name in ("include_repo_ids", "empty_wiki_ids", "protected_destination_ids"):
+            ids = getattr(c, name)
+            if (
+                not isinstance(ids, list)
+                or any(type(i) is not int or i <= 0 for i in ids)
+                or len(set(ids)) != len(ids)
+            ):
+                raise BackupError(f"{name} must contain unique positive integers")
+
         for owner in (c.source_owner, c.destination_owner):
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", owner):
                 raise BackupError("Invalid GitHub personal account name")

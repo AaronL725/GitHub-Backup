@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import copy
 import datetime as dt
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
 import sys
+import uuid
 
 from .archive import Archive
 from .common import BackupError, atomic_json, read_json, run, utcnow
 from .exporter import validate_metadata, verify_checksums
 from .git import Git, github_clone_url
-from .github import GitHub, backup_releases
+from .github import GitHub, backup_releases, check_write_cooldown
 
 
 UNSUPPORTED = {
@@ -62,7 +65,11 @@ class Controller:
         self.archive = archive or Archive(config)
         self.source_git = Git(self.source.token, config.command_timeout_seconds)
         self.destination_git = Git(
-            self.destination.token, config.command_timeout_seconds
+            self.destination.token,
+            config.command_timeout_seconds,
+            write_guard=lambda: check_write_cooldown(
+                self.root / "destination-backoff.json"
+            ),
         )
         self._audit_cache = {}
 
@@ -114,13 +121,10 @@ class Controller:
             "and older file versions. Google Drive access is required; source GitHub credentials are not.\n"
         )
 
-    def identities(self):
-        source = self.source.get("/user")
-        destination = self.destination.get("/user")
-        for role, user, owner in (
-            ("source", source, self.c.source_owner),
-            ("destination", destination, self.c.destination_owner),
-        ):
+    def identities(self, roles=("source", "destination")):
+        for role in roles:
+            user = getattr(self, role).get("/user")
+            owner = getattr(self.c, role + "_owner")
             if user["login"].lower() != owner.lower() or user.get("type") != "User":
                 raise BackupError(
                     f"{role} credential does not identify the configured personal account"
@@ -129,7 +133,7 @@ class Controller:
             if self.state.get(key, user["id"]) != user["id"]:
                 raise BackupError(f"{role} account ID changed")
             self.state[key] = user["id"]
-        if source["id"] == destination["id"]:
+        if self.state.get("source_owner_id") == self.state.get("destination_owner_id"):
             raise BackupError("Source and destination account IDs are identical")
         self.save()
 
@@ -279,9 +283,18 @@ class Controller:
         (folder / pending["category"]).mkdir(parents=True, exist_ok=True, mode=0o700)
         if not (folder / "source.json").exists():
             atomic_json(folder / "source.json", entry["source"])
-        snapshot = self.archive.backup(
-            rid, pending["category"], complete=pending["ready"]
-        )
+        if entry.get("drive_pending"):
+            self.queue_capture(rid, entry)
+            raise BackupError("Drive backlog retained; new capture queued in order")
+        try:
+            snapshot = self.archive.backup(
+                rid, pending["category"], complete=pending["ready"]
+            )
+        except Exception as exc:
+            self.queue_capture(rid, entry)
+            message = str(exc) if isinstance(exc, BackupError) else type(exc).__name__
+            raise BackupError(message) from None
+
         if pending["ready"]:
             category = pending["category"]
             entry[category + "_snapshot"] = snapshot
@@ -294,6 +307,87 @@ class Controller:
                 if pending.get("full"):
                     entry["metadata_full_at"] = utcnow()
         entry.pop("pending")
+        self.save()
+
+    def queue_capture(self, rid, entry):
+        """Keep a durable local version while Drive is offline; GitHub can publish it."""
+        pending = entry["pending"]
+        queue = self.root / "drive-queue" / (".building-" + uuid.uuid4().hex)
+        queue.mkdir(parents=True, mode=0o700)
+
+        def copy_file(src, dst):
+            if "/objects/" in str(src):
+                os.link(src, dst)
+            else:
+                shutil.copy2(src, dst)
+
+        category = pending["category"]
+        target = queue / "repos" / rid / category
+        shutil.copytree(
+            self.root / "repos" / rid / category, target, copy_function=copy_file
+        )
+        shutil.copy2(
+            self.root / "repos" / rid / "source.json", target.parent / "source.json"
+        )
+        if (self.root / "recovery").exists():
+            shutil.copytree(self.root / "recovery", queue / "recovery")
+        atomic_json(queue / "state.json", self.state)
+        atomic_json(
+            queue / "capture.json",
+            {
+                "at": pending["started_at"],
+                "repo_id": rid,
+                "category": category,
+                "complete": pending["ready"],
+            },
+        )
+        queue.rename(queue.with_name(queue.name.removeprefix(".building-")))
+        if pending["ready"]:
+            entry[category + "_local_capture"] = True
+        entry["drive_pending"] = True
+        if pending["ready"] and category == "metadata" and pending.get("content_hash"):
+            entry["metadata_content_hash"] = pending["content_hash"]
+        if pending["ready"] and category == "git":
+            entry["git_retry"] = False
+            entry["publish_pending"] = True
+        entry.pop("pending")
+        self.save()
+
+    def drain_queue(self):
+        folders = sorted(
+            (
+                p
+                for p in (self.root / "drive-queue").glob("*")
+                if not p.name.startswith(".")
+            ),
+            key=lambda p: p.stat().st_mtime_ns,
+        )
+        remaining = {}
+        for folder in folders:
+            rid = read_json(folder / "capture.json")["repo_id"]
+            remaining[rid] = remaining.get(rid, 0) + 1
+            self.state["repositories"][rid]["drive_pending"] = True
+        self.save()
+        for folder in folders:
+            capture = read_json(folder / "capture.json")
+            config = copy.copy(self.c)
+            config.data_dir = str(folder)
+            if capture["complete"]:
+                verify_restored(folder, capture["repo_id"])
+            snapshot = Archive(config).backup(
+                capture["repo_id"], capture["category"], complete=capture["complete"]
+            )
+            entry = self.state["repositories"][capture["repo_id"]]
+            if capture["complete"]:
+                entry[capture["category"] + "_snapshot"] = snapshot
+                entry[capture["category"] + "_archived_at"] = utcnow()
+            remaining[capture["repo_id"]] -= 1
+            if not remaining[capture["repo_id"]]:
+                entry.pop("drive_pending", None)
+            self.save()
+            shutil.rmtree(folder)
+        for entry in self.state["repositories"].values():
+            entry.pop("drive_pending", None)
         self.save()
 
     def begin(self, rid, entry, category, *, full=False):
@@ -352,7 +446,7 @@ class Controller:
         current = {k: before.get(k) for k in expected}
         if (
             expected == current
-            and entry.get("git_snapshot")
+            and (entry.get("git_snapshot") or entry.get("git_local_capture"))
             and not entry.get("git_retry")
         ):
             if wiki_status == "unavailable_or_uninitialized":
@@ -370,6 +464,9 @@ class Controller:
         if wiki_refs:
             self.source_git.fetch(wiki_url, folder / "wiki.git", "master")
             self.source_git.lfs(folder / "wiki.git")
+            expected["wiki_refs"] = self.source_git.refs(folder / "wiki.git")
+            if expected["wiki_refs"] != self.source_git.remote_refs(wiki_url):
+                raise BackupError("Wiki refs changed during collection; retry required")
         atomic_json(
             folder / "manifest.json",
             {**expected, "refs": self.source_git.refs(git_dir), "lfs": lfs},
@@ -384,6 +481,9 @@ class Controller:
         self.save()
 
     def collect_metadata(self, rid, entry, *, full=False):
+        existing = self.root / "repos" / rid / "metadata"
+        if (existing / "checksums.json").exists():
+            verify_checksums(existing)
         full = (
             full
             or entry.get("metadata_force_full", False)
@@ -447,12 +547,12 @@ class Controller:
             json.dumps([entry["source"], content], sort_keys=True).encode()
         ).hexdigest()
         if (
-            entry.get("metadata_snapshot")
-            and entry.get("metadata_content_hash") == signature
-        ):
+            entry.get("metadata_snapshot") or entry.get("metadata_local_capture")
+        ) and entry.get("metadata_content_hash") == signature:
             entry.pop("pending")
             entry["metadata_force_full"] = False
         else:
+            entry["pending"]["content_hash"] = signature
             self.ready(rid, entry)
             entry["metadata_content_hash"] = signature
         entry["metadata_checked_at"] = utcnow()
@@ -464,11 +564,11 @@ class Controller:
         if not entry.get("publish_pending"):
             return
         if (
-            not entry.get("git_snapshot")
+            not (entry.get("git_snapshot") or entry.get("git_local_capture"))
             or entry.get("pending")
             or entry.get("git_retry")
         ):
-            raise BackupError("Publishing requires a completed remote archive")
+            raise BackupError("Publishing requires a completed durable capture")
         target = self.ensure_target(rid, entry)
         folder = self.root / "repos" / rid / "git" / "repository.git"
         manifest = read_json(folder.parent / "manifest.json")
@@ -520,30 +620,55 @@ class Controller:
 
     def sync(self, kind="all", *, full=False):
         self.recovery_files()
-        try:
-            self.archive.available()
-        except BackupError as exc:
-            self.record_run(kind, [{"stage": "archive", "error": str(exc)}])
-            raise
         errors = []
         self._audit_cache = {}
+        try:
+            self.archive.available()
+            self.drain_queue()
+        except Exception as exc:
+            errors.append(
+                {
+                    "stage": "archive",
+                    "error": str(exc)
+                    if isinstance(exc, BackupError)
+                    else type(exc).__name__,
+                }
+            )
+        target_ok = True
+        try:
+            self.identities(("destination",))
+        except Exception as exc:
+            target_ok = False
+            errors.append(
+                {
+                    "stage": "target",
+                    "error": str(exc)
+                    if isinstance(exc, BackupError)
+                    else type(exc).__name__,
+                }
+            )
         # Upload queued generations even if the original account is now banned.
         for rid, entry in self.state["repositories"].items():
             try:
                 self.flush(rid, entry)
             except BackupError as exc:
                 errors.append({"repo_id": rid, "stage": "archive", "error": str(exc)})
-        # Audit privacy even for repositories no longer present in the source list.
+        target_blocked = set()
+        # Audit only affects publication, never source collection.
         for rid, entry in self.state["repositories"].items():
-            if entry.get("target_id"):
+            if target_ok and entry.get("target_id"):
                 try:
                     self._audit_cache[rid] = self.checked_target(entry)
-                except BackupError as exc:
+                except Exception as exc:
+                    message = (
+                        str(exc) if isinstance(exc, BackupError) else type(exc).__name__
+                    )
+                    target_blocked.add(rid)
                     errors.append(
-                        {"repo_id": rid, "stage": "privacy", "error": str(exc)}
+                        {"repo_id": rid, "stage": "privacy", "error": message}
                     )
         try:
-            self.identities()
+            self.identities(("source",))
             self.discover()
         except Exception as exc:
             errors.append(
@@ -558,7 +683,13 @@ class Controller:
             raise BackupError(
                 "Source/destination identity or inventory unavailable; existing backups preserved"
             ) from None
-        blocked = {e["repo_id"] for e in errors}
+        blocked = {
+            e["repo_id"]
+            for e in errors
+            if e.get("repo_id")
+            and e["stage"] == "archive"
+            and self.state["repositories"][e["repo_id"]].get("pending")
+        }
         for rid, entry in self.state["repositories"].items():
             if rid in blocked:
                 continue
@@ -579,17 +710,28 @@ class Controller:
                 )
                 continue
             try:
+                if not target_ok or rid in target_blocked:
+                    raise BackupError("Target unavailable; source collection continues")
                 self.ensure_target(rid, entry)
                 target_available = True
-            except BackupError as exc:
-                errors.append({"repo_id": rid, "stage": "target", "error": str(exc)})
+            except Exception as exc:
+                message = (
+                    str(exc) if isinstance(exc, BackupError) else type(exc).__name__
+                )
+                errors.append({"repo_id": rid, "stage": "target", "error": message})
                 target_available = False
+                entry["publish_pending"] = True
+                self.save()
                 # A destination outage must not prevent off-site collection.
             for category in ["git", "metadata"] if kind == "all" else [kind]:
                 try:
                     if category == "git":
                         self.collect_git(rid, entry)
-                        if entry.get("git_snapshot") and entry.get("target_id"):
+                        if (
+                            target_available
+                            and entry.get("git_snapshot")
+                            and entry.get("target_id")
+                        ):
                             target = self._audit_cache.get(rid) or self.checked_target(
                                 entry
                             )
@@ -625,9 +767,12 @@ class Controller:
                 try:
                     if target_available:
                         self.publish(rid, entry)
-                except BackupError as exc:
+                except Exception as exc:
+                    message = (
+                        str(exc) if isinstance(exc, BackupError) else type(exc).__name__
+                    )
                     errors.append(
-                        {"repo_id": rid, "stage": "publish", "error": str(exc)}
+                        {"repo_id": rid, "stage": "publish", "error": message}
                     )
         self.record_run(kind, errors)
         if errors:

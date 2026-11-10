@@ -97,6 +97,7 @@ def snapshot(config):
             bool(r.get("published_at")) and not r.get("publish_pending") for r in rows
         ),
         "targets": sum(bool(r.get("target_id")) for r in rows),
+        "drive_pending": sum(bool(r.get("drive_pending")) for r in rows),
         "healthy": report["healthy"],
         "busy": busy(config.root),
         "errors": errors,
@@ -147,6 +148,7 @@ def status_card(view, config):
         "",
         f"💾 本机剩余 <b>{view['disk_free'] / 1024**3:.1f} GiB</b>",
         f"🗃 已创建私密目标 <b>{view['targets']}</b> · 已有副本均保留",
+        f"📤 Drive 待补传仓库 <b>{view['drive_pending']}</b>",
         "☁️ 明文文件 <code>Drive / GitHub-Backup</code>",
         f"⚠️ 已报告失败 <b>{len(view['errors'])}</b>",
         f"🕒 最近发现 {stamp(view['last_discovery'], config.telegram_timezone)}",

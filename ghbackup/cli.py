@@ -71,11 +71,13 @@ def status(config, max_age=None):
                 "published_at",
                 "pending",
                 "publish_pending",
+                "drive_pending",
             )
         }
         row["repo_id"] = rid
         if (
             entry.get("pending")
+            or entry.get("drive_pending")
             or entry.get("publish_pending")
             or entry.get("source_status") != "accessible"
             or not entry.get("git_snapshot")

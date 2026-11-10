@@ -6,14 +6,14 @@ WORKDIR /app
 COPY deploy/tools.lock.json /app/deploy/tools.lock.json
 COPY scripts/install-tools.py /app/scripts/install-tools.py
 RUN python scripts/install-tools.py --bin-dir /usr/local/bin
-COPY requirements.lock requirements-telegram.lock /app/
-RUN pip install --no-cache-dir -r requirements.lock -r requirements-telegram.lock
+COPY requirements.lock requirements-telegram.lock requirements-build.lock /app/
+RUN pip install --no-cache-dir --require-hashes -r requirements.lock -r requirements-telegram.lock -r requirements-build.lock
 ARG GHBACKUP_UID=10001
 ARG GHBACKUP_GID=10001
 RUN groupadd -g ${GHBACKUP_GID} ghbackup && useradd -u ${GHBACKUP_UID} -g ghbackup -d /var/lib/ghbackup ghbackup
 COPY pyproject.toml /app/
 COPY ghbackup /app/ghbackup
-RUN pip install --no-deps --no-cache-dir .
+RUN pip install --no-deps --no-build-isolation --no-cache-dir .
 USER ghbackup
 ENTRYPOINT ["python", "-m", "ghbackup"]
 CMD ["scheduler"]

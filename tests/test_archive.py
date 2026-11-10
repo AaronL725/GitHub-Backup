@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import tempfile
 import unittest
+from subprocess import TimeoutExpired
 
 from ghbackup.archive import Archive
 from ghbackup.common import atomic_json
@@ -18,6 +19,118 @@ from test_safety import config, repository
     shutil.which("rclone") and shutil.which("git-lfs"), "Git LFS and rclone required"
 )
 class ArchiveTests(unittest.TestCase):
+    def test_destination_outage_keeps_restorable_drive_capture_and_retries_publish(
+        self,
+    ):
+        from ghbackup.controller import Controller
+        from ghbackup.common import BackupError
+        from test_safety import Source, Destination
+        from unittest.mock import patch
+
+        target = self.base / "github-target.git"
+        self.git.command("init", "--bare", "--initial-branch=main", target)
+        mapping = {
+            "https://github.com/alice/project.git": str(self.work),
+            "https://github.com/bob/project--10.git": str(target),
+        }
+
+        class LocalGit(Git):
+            def command(inner, *args, **kwargs):
+                return super().command(
+                    *(mapping.get(str(a), a) for a in args), **kwargs
+                )
+
+        destination = Destination()
+        controller = Controller(
+            self.c, source=Source(), destination=destination, archive=self.archive
+        )
+        controller.source_git = LocalGit()
+        controller.destination_git = LocalGit()
+        with patch.object(
+            destination, "get", side_effect=BackupError("account unavailable")
+        ):
+            with self.assertRaises(BackupError):
+                controller.sync("git")
+        entry = controller.state["repositories"]["10"]
+        self.assertTrue(entry["git_snapshot"])
+        self.assertTrue(entry["publish_pending"])
+        restored = self.base / "target-outage-restore"
+        self.archive.restore("10", restored, category="git")
+        verify_restored(restored, "10")
+        self.assertEqual(
+            (restored / "repos/10/git/code/README.md").read_text(), "first version\n"
+        )
+        controller.sync("git")
+        self.assertFalse(entry["publish_pending"])
+        self.assertEqual(self.git.refs(target), self.git.refs(self.work))
+
+    def test_drive_outage_keeps_github_live_and_preserves_each_queued_version(self):
+        from ghbackup.controller import Controller
+        from ghbackup.common import BackupError
+        from test_safety import Source, Destination
+        from unittest.mock import patch
+
+        target = self.base / "github-target.git"
+        self.git.command("init", "--bare", "--initial-branch=main", target)
+        mapping = {
+            "https://github.com/alice/project.git": str(self.work),
+            "https://github.com/bob/project--10.git": str(target),
+        }
+
+        class LocalGit(Git):
+            def command(inner, *args, **kwargs):
+                return super().command(
+                    *(mapping.get(str(a), a) for a in args), **kwargs
+                )
+
+        controller = Controller(
+            self.c, source=Source(), destination=Destination(), archive=self.archive
+        )
+        controller.source_git = LocalGit()
+        controller.destination_git = LocalGit()
+        with (
+            patch.object(
+                self.archive, "backup", side_effect=TimeoutExpired("rclone", 1)
+            ),
+            patch.object(
+                controller, "drain_queue", side_effect=BackupError("Drive offline")
+            ),
+        ):
+            with self.assertRaises(BackupError):
+                controller.sync("git")
+            (self.work / "README.md").write_text("second captured version\n")
+            self.commit()
+            with self.assertRaises(BackupError):
+                controller.sync("git")
+        self.assertEqual(
+            controller.destination_git.refs(target)["refs/heads/main"],
+            self.git.refs(self.work)["refs/heads/main"],
+        )
+        self.assertEqual(len(list((self.c.root / "drive-queue").iterdir())), 2)
+        controller.sync("git")
+        self.assertEqual(list((self.c.root / "drive-queue").iterdir()), [])
+        points = self.archive.snapshots("10")
+        self.assertEqual(len(points), 2)
+        self.archive.restore(
+            "10", self.base / "old-queued", points[0]["id"], category="git"
+        )
+        self.assertEqual(
+            (self.base / "old-queued/repos/10/git/code/README.md").read_text(),
+            "first version\n",
+        )
+
+    def test_legacy_flat_indexes_migrate_once_without_deleting_history(self):
+        point = self.archive.backup("10", "git", complete=True)
+        root = self.base / "archive/_系统"
+        shutil.copy2(
+            root / "index/10" / f"{point}.json", root / "index" / f"{point}.json"
+        )
+        (root / "index/10" / f"{point}.json").unlink()
+        (root / "index-version.json").unlink()
+        self.assertEqual(self.archive.snapshots("10")[0]["id"], point)
+        self.assertTrue((root / "index" / f"{point}.json").exists())
+        self.assertEqual(len(self.archive.snapshots()), 1)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -113,3 +226,36 @@ class ArchiveTests(unittest.TestCase):
         self.assertTrue((self.base / "archive/renamed--10/代码/README.md").exists())
         self.archive.restore("10", self.base / "renamed-restore", first, category="git")
         verify_restored(self.base / "renamed-restore", "10")
+
+    def test_verify_skips_repository_missing_metadata(self):
+        self.archive.backup("10", "git", complete=True)
+        other = self.c.root / "repos/20"
+        shutil.copytree(self.repo, other)
+        atomic_json(other / "source.json", repository(rid=20, name="complete"))
+        atomic_json(other / "metadata/issue.json", {"body": "ok"})
+        validate_metadata(other / "metadata")
+        self.archive.backup("20", "git", complete=True)
+        self.archive.backup("20", "metadata", complete=True)
+        self.archive.check()
+        self.assertEqual(
+            json.loads((self.c.root / "plain-verification.json").read_text())[
+                "repo_id"
+            ],
+            "20",
+        )
+
+    def test_restore_reads_only_requested_repository_index(self):
+        point = self.archive.backup("10", "git", complete=True)
+        from unittest.mock import patch
+
+        with patch.object(self.archive, "json", wraps=self.archive.json) as reads:
+            self.archive.restore(
+                "10", self.base / "scoped-restore", point, category="git"
+            )
+        indexes = [
+            call.args[0]
+            for call in reads.call_args_list
+            if call.args[0].startswith("_系统/index/")
+        ]
+        self.assertTrue(indexes)
+        self.assertTrue(all(path.startswith("_系统/index/10/") for path in indexes))

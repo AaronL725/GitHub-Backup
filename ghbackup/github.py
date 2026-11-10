@@ -15,6 +15,11 @@ from urllib.request import Request, HTTPRedirectHandler, build_opener
 from .common import BackupError, atomic_json, read_json, sha256
 
 
+def check_write_cooldown(path):
+    if path and read_json(Path(path), {}).get("until", 0) > time.time():
+        raise APIError(403, secondary=True)
+
+
 class APIError(BackupError):
     def __init__(self, status, *, secondary=False):
         self.status = status
@@ -91,11 +96,7 @@ class GitHub:
             )
             if not allowed:
                 raise BackupError("Mutation refused by backup API allowlist")
-            if (
-                self.cooldown_file
-                and read_json(self.cooldown_file, {}).get("until", 0) > time.time()
-            ):
-                raise APIError(403, secondary=True)
+            check_write_cooldown(self.cooldown_file)
             if self.protected_repository_ids and path.startswith("/repos/"):
                 parts = path.split("/")
                 target = self.get("/".join(parts[:4]))

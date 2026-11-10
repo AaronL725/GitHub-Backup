@@ -142,6 +142,7 @@ class Archive:
                 "_系统/format.json", {"format": FORMAT, "encrypted": False}, root
             )
             self.upload_json("_系统/repos.json", {}, root)
+            self.upload_json("_系统/index-version.json", {"version": 2}, root)
             info = root / "README.md"
             info.write_text(
                 "# GitHub 备份\n\n每个仓库单独存放：代码、元数据和 Git历史是当前文件；历史保存被替换的旧文件；恢复点保存校验清单。\n\n"
@@ -185,7 +186,12 @@ class Archive:
         source = self.config.root / "repos" / repo_id
         repo = read_json(source / "source.json")
         identifier = uuid.uuid4().hex
-        now = dt.datetime.now(dt.timezone.utc)
+        capture = read_json(self.config.root / "capture.json", {})
+        now = (
+            dt.datetime.fromisoformat(capture["at"])
+            if capture
+            else dt.datetime.now(dt.timezone.utc)
+        )
         stamp = (
             now.astimezone().strftime("%Y-%m-%d/%H%M%S")
             + "-"
@@ -299,7 +305,11 @@ class Archive:
                 k: manifest[k]
                 for k in ["id", "repo_id", "category", "complete", "time", "control"]
             }
-            self.upload_json("_系统/index/" + identifier + ".json", summary, workspace)
+            self.upload_json(
+                "_系统/index/" + repo_id + "/" + identifier + ".json",
+                summary,
+                workspace,
+            )
             recovery = self.config.root / "recovery"
             if recovery.exists():
                 self.command(
@@ -311,22 +321,44 @@ class Archive:
                 )
         return identifier
 
-    def snapshots(self):
-        listing = self.command(
-            "lsjson", self.path("_系统/index"), "--files-only", missing=True
+    def migrate_index(self):
+        if self.json("_系统/index-version.json", {}).get("version") == 2:
+            return
+        listing = json.loads(
+            self.command(
+                "lsjson", self.path("_系统/index"), "--files-only", missing=True
+            )
+            or "[]"
         )
-        rows = [
-            self.json("_系统/index/" + item["Path"])
-            for item in json.loads(listing or "[]")
-        ]
-        return sorted(rows, key=lambda r: r["time"])
+        with tempfile.TemporaryDirectory(dir=self.config.root) as t:
+            for item in listing:
+                row = self.json("_系统/index/" + item["Path"])
+                self.upload_json(
+                    "_系统/index/" + row["repo_id"] + "/" + row["id"] + ".json",
+                    row,
+                    Path(t),
+                )
+            self.upload_json("_系统/index-version.json", {"version": 2}, Path(t))
+
+    def snapshots(self, repo_id=None):
+        self.migrate_index()
+        prefix = "_系统/index" + ("/" + repo_id if repo_id else "")
+        listing = json.loads(
+            self.command(
+                "lsjson", self.path(prefix), "--files-only", "--recursive", missing=True
+            )
+            or "[]"
+        )
+        paths = [item["Path"] for item in listing if repo_id or "/" in item["Path"]]
+        rows = [self.json(prefix + "/" + path) for path in paths]
+        return sorted(rows, key=lambda row: row["time"])
 
     def restore(self, repo_id, target, snapshot="latest", *, category=None):
         if target.exists():
             raise BackupError("Restore target must not exist")
         rows = [
             r
-            for r in self.snapshots()
+            for r in self.snapshots(repo_id)
             if r["repo_id"] == repo_id
             and r["complete"]
             and (snapshot == "latest" or r["id"].startswith(snapshot))
@@ -422,7 +454,16 @@ class Archive:
         rows = [r for r in self.snapshots() if r["complete"]]
         if not rows:
             raise BackupError("No completed restore point to verify")
-        ids = sorted({row["repo_id"] for row in rows})
+        categories = {}
+        for row in rows:
+            categories.setdefault(row["repo_id"], set()).add(row["category"])
+        ids = sorted(
+            rid for rid, kinds in categories.items() if {"git", "metadata"} <= kinds
+        )
+        if not ids:
+            raise BackupError(
+                "No repository has both complete Git and metadata restore points"
+            )
         cursor = self.config.root / "plain-verification.json"
         index = (read_json(cursor, {}).get("index", -1) + 1) % len(ids)
         with tempfile.TemporaryDirectory(dir=self.config.root) as t:
