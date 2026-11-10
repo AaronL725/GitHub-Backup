@@ -324,21 +324,35 @@ class Archive:
     def migrate_index(self):
         if self.json("_系统/index-version.json", {}).get("version") == 2:
             return
-        listing = json.loads(
-            self.command(
-                "lsjson", self.path("_系统/index"), "--files-only", missing=True
-            )
-            or "[]"
-        )
         with tempfile.TemporaryDirectory(dir=self.config.root) as t:
-            for item in listing:
-                row = self.json("_系统/index/" + item["Path"])
-                self.upload_json(
-                    "_系统/index/" + row["repo_id"] + "/" + row["id"] + ".json",
-                    row,
-                    Path(t),
-                )
-            self.upload_json("_系统/index-version.json", {"version": 2}, Path(t))
+            root = Path(t)
+            legacy, indexes = root / "legacy", root / "index"
+            legacy.mkdir()
+            indexes.mkdir()
+            self.command(
+                "copy",
+                self.path("_系统/index"),
+                legacy,
+                "--max-depth",
+                "1",
+                "--include",
+                "*.json",
+                "--transfers",
+                "4",
+                missing=True,
+            )
+            for file in legacy.glob("*.json"):
+                row = read_json(file)
+                atomic_json(indexes / row["repo_id"] / (row["id"] + ".json"), row)
+            self.command(
+                "copy",
+                indexes,
+                self.path("_系统/index"),
+                "--checksum",
+                "--transfers",
+                "4",
+            )
+            self.upload_json("_系统/index-version.json", {"version": 2}, root)
 
     def snapshots(self, repo_id=None):
         self.migrate_index()
