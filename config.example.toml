@@ -20,5 +20,7 @@ data_dir = "/var/lib/ghbackup"
 minimum_free_bytes = 5368709120
 include_repo_ids = []
 empty_wiki_ids = []
+# Set true only after confirming repositories have never used Wiki.
+attest_uninitialized_wikis = false
 protected_destination_ids = []
 destination_write_cooldown_seconds = 3600

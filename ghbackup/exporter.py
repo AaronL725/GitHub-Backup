@@ -100,6 +100,15 @@ def export(repo_file: Path, output: Path, token: str, *, full=False):
     args = upstream.parse_args(flags)
     if (output / "checksums.json").exists():
         verify_checksums(output)
+    # Validate the old paths before applying a source repository rename.
+    repos_dir = output / "repositories"
+    if repos_dir.exists():
+        previous = [p for p in repos_dir.iterdir() if p.is_dir()]
+        wanted = repos_dir / repo["name"]
+        if len(previous) == 1 and previous[0] != wanted and not wanted.exists():
+            previous[0].rename(wanted)
+        elif len(previous) > 1:
+            raise BackupError("Ambiguous metadata directories; refusing to merge")
 
     class Errors(logging.Handler):
         failed = False

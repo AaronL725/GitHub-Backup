@@ -32,6 +32,8 @@ docker compose up -d --build
 
 增量元数据采集前校验已有 SHA256，损坏时中止并报警，不重新信任损坏内容；应先从有效恢复点恢复或重建该资源。恢复点索引位于 `_系统/index/仓库ID/`，恢复时只读取该仓库的索引；旧索引复制迁移后保留原文件。仅同时拥有完整 Git 和元数据恢复点的仓库参与完整恢复校验。
 
+`attest_uninitialized_wikis = true` 表示用户确认默认所有仓库未使用 Wiki，新仓库自动适用；可读取的 Wiki 仍照常备份，曾有 Wiki 历史的仓库读取失败仍报警。未作此确认时保持 `false`，或用 `empty_wiki_ids` 逐仓库确认。
+
 ## Drive 存储结构
 
 ```text

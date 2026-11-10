@@ -141,6 +141,7 @@ class Config:
     api_retries: int = 5
     # Explicitly attested IDs only; otherwise an unavailable enabled wiki is a failure.
     empty_wiki_ids: list[int] = dataclasses.field(default_factory=list)
+    attest_uninitialized_wikis: bool = False
     include_repo_ids: list[int] = dataclasses.field(default_factory=list)
     # Immutable repository IDs present in the destination before initial setup.
     protected_destination_ids: list[int] = dataclasses.field(default_factory=list)

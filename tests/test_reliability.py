@@ -6,13 +6,34 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ghbackup.common import BackupError, Config, atomic_json
-from ghbackup.exporter import export, validate_metadata
+from ghbackup.exporter import export, validate_metadata, verify_checksums
 from ghbackup.git import Git
 from ghbackup.github import check_write_cooldown
 from ghbackup.telemetry import Store
 
 
 class ReliabilityTests(unittest.TestCase):
+    def test_metadata_rename_validates_old_paths_before_moving(self):
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            output = root / "output"
+            atomic_json(output / "repositories/old/issues/1.json", {"body": "intact"})
+            validate_metadata(output)
+            atomic_json(
+                root / "source.json",
+                {
+                    "id": 10,
+                    "name": "new",
+                    "owner": {"login": "alice"},
+                    "full_name": "alice/new",
+                },
+            )
+            with patch("github_backup.github_backup.backup_repositories"):
+                export(root / "source.json", output, "github_pat_fake")
+            verify_checksums(output)
+            self.assertTrue((output / "repositories/new/issues/1.json").is_file())
+            self.assertFalse((output / "repositories/old").exists())
+
     def test_id_lists_reject_invalid_types_and_duplicates(self):
         with tempfile.TemporaryDirectory() as t:
             path = Path(t) / "config.toml"

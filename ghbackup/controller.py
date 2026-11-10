@@ -431,7 +431,11 @@ class Controller:
                 wiki_refs = self.source_git.remote_refs(wiki_url)
                 wiki_status = "present" if wiki_refs else "empty"
             except BackupError:
-                if int(rid) not in self.c.empty_wiki_ids or before.get("wiki_refs"):
+                wiki_refs = before.get("wiki_refs", {})
+                if before.get("wiki_refs") or (
+                    int(rid) not in self.c.empty_wiki_ids
+                    and not self.c.attest_uninitialized_wikis
+                ):
                     # Code and wiki are collected separately below: preserve code even
                     # if the wiki's absence cannot be distinguished from lack of access.
                     wiki_status = "unavailable_or_uninitialized"
@@ -461,7 +465,7 @@ class Controller:
         self.save()
         self.source_git.fetch(url, git_dir, repo.get("default_branch"))
         lfs = self.source_git.lfs(git_dir)
-        if wiki_refs:
+        if wiki_refs and wiki_status == "present":
             self.source_git.fetch(wiki_url, folder / "wiki.git", "master")
             self.source_git.lfs(folder / "wiki.git")
             expected["wiki_refs"] = self.source_git.refs(folder / "wiki.git")
@@ -494,15 +498,6 @@ class Controller:
         atomic_json(root / "source.json", entry["source"])
         metadata = root / "metadata"
         output = metadata / "export"
-        repos_dir = output / "repositories"
-        # Only this one stable-ID directory is owned by this invocation.
-        if repos_dir.exists():
-            previous = [p for p in repos_dir.iterdir() if p.is_dir()]
-            wanted = repos_dir / entry["name"]
-            if len(previous) == 1 and previous[0] != wanted and not wanted.exists():
-                previous[0].rename(wanted)
-            elif len(previous) > 1:
-                raise BackupError("Ambiguous metadata directories; refusing to merge")
         args = [
             sys.executable,
             "-m",

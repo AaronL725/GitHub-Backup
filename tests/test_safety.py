@@ -282,6 +282,27 @@ class ControllerSafetyTests(unittest.TestCase):
         manifest = read_json(self.c.root / "repos/10/git/manifest.json")
         self.assertEqual(manifest["wiki_refs"], new)
 
+    def test_global_empty_wiki_attestation_preserves_existing_wiki_warnings(self):
+        self.c.attest_uninitialized_wikis = True
+        entry = self.ctrl.state["repositories"]["10"]
+        entry["source"]["has_wiki"] = True
+        main = {"refs/heads/main": "a" * 40}
+        git = Mock()
+        git.remote_refs.side_effect = [main, BackupError("Wiki missing")]
+        git.refs.return_value = main
+        git.lfs.return_value = []
+        self.ctrl.source_git = git
+        self.ctrl.collect_git("10", entry)
+        path = self.c.root / "repos/10/git/manifest.json"
+        manifest = read_json(path)
+        self.assertEqual(manifest["wiki_status"], "attested_empty")
+        manifest["wiki_refs"] = {"refs/heads/master": "b" * 40}
+        atomic_json(path, manifest)
+        git.remote_refs.side_effect = [main, BackupError("Wiki unavailable")]
+        with self.assertRaisesRegex(BackupError, "wiki inaccessible"):
+            self.ctrl.collect_git("10", entry)
+        self.assertEqual(read_json(path)["wiki_refs"], manifest["wiki_refs"])
+
     def test_wiki_update_after_fetch_does_not_commit_a_mismatched_manifest(self):
         entry = self.ctrl.state["repositories"]["10"]
         entry["source"]["has_wiki"] = True
