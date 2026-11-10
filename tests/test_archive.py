@@ -72,6 +72,8 @@ class ArchiveTests(unittest.TestCase):
     ):
         from ghbackup.controller import Controller
         from test_safety import Source, Destination
+        from ghbackup.common import BackupError
+        from unittest.mock import patch
 
         target = self.base / "evicted-target.git"
         self.git.command("init", "--bare", "--initial-branch=main", target)
@@ -116,6 +118,18 @@ class ArchiveTests(unittest.TestCase):
             (self.base / "before-eviction/repos/10/git/code/README.md").read_text(),
             "first version\n",
         )
+        (self.work / "README.md").write_text("captured while target unavailable\n")
+        self.commit()
+        with patch.object(
+            controller.destination, "get", side_effect=BackupError("target unavailable")
+        ):
+            with self.assertRaises(BackupError):
+                controller.sync("git")
+        self.assertTrue(controller.state["repositories"]["10"]["publish_pending"])
+        self.assertFalse((self.repo / "git/repository.git").exists())
+        controller.sync("git")
+        self.assertEqual(self.git.refs(target), self.git.refs(self.work))
+        self.assertFalse((self.repo / "git/repository.git").exists())
 
     def test_destination_outage_keeps_restorable_drive_capture_and_retries_publish(
         self,

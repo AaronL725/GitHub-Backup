@@ -668,11 +668,7 @@ class Controller:
         ):
             return
         root = self.root / "repos" / rid
-        if (
-            entry.get("git_snapshot")
-            and not entry.get("git_retry")
-            and not entry.get("publish_pending")
-        ):
+        if entry.get("git_snapshot") and not entry.get("git_retry"):
             for name in ("repository.git", "wiki.git", "code"):
                 shutil.rmtree(root / "git" / name, ignore_errors=True)
         if (

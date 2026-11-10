@@ -31,7 +31,7 @@ python3 scripts/setup-storage.py        # root：配置有硬上限的工作盘�
 
 元数据同步在仓库之间交还文件锁，让等待的 Git 任务先运行；重新获得锁后重载状态，避免覆盖另一任务的进度。
 
-每次备份/恢复前及每小时自动清理中断遗留的临时目录。恢复导出默认保留 24 小时，可通过 `restore_retention_hours` 修改；有用的恢复文件应及时移出。未完成采集、未补传版本及待发布 Git 缓存不因清理而删除。剩余不足 `minimum_free_bytes`（默认 1 GiB）时停止新采集并告警；内核硬上限同时约束单次大文件写入。Drive 历史不设容量或保留期上限。
+每次备份/恢复前及每小时自动清理中断遗留的临时目录。恢复导出默认保留 24 小时，可通过 `restore_retention_hours` 修改；有用的恢复文件应及时移出。未完成采集、未补传版本不因清理而删除。Drive 已保存完整 Git 恢复点时，GitHub 故障只保留待发布状态，恢复后从 Drive 补齐，避免目标故障堆积本地缓存。剩余不足 `minimum_free_bytes`（默认 1 GiB）时停止新采集并告警；内核硬上限同时约束单次大文件写入。Drive 历史不设容量或保留期上限。
 
 `data/runtime/rclone.conf` 是程序维护的 OAuth 缓存，不需要单独配置或提交。真实配置只读挂载进容器，不会写入镜像或备份恢复模板。手动执行清理可用 `docker compose exec scheduler python -m ghbackup --wait-lock cleanup`。
 
